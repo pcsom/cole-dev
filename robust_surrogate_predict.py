@@ -7,6 +7,7 @@ Methodology:
     then subsample exactly N (15, 50, 150, etc.) from train_pool for training
   - Constant test size ensures stable evaluation even with tiny training sets
   - Target scaling (mean=0, std=1) for balanced gradients, NO feature scaling
+  - Primary Metric: Kendall's Tau (rank correlation)
 
 Based on Nadeau & Bengio (2003): Inference for the Generalization Error
 """
@@ -20,6 +21,7 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 import scipy.stats as stats
+from scipy.stats import kendalltau
 from typing import List, Dict, Optional, Tuple
 import os
 
@@ -146,15 +148,21 @@ def train_model_on_subsample(
         acc_pred = test_pred[:, 1]
         acc_true = test_true[:, 1]
         
-        # R2 score
+        # Kendall's Tau - PRIMARY METRIC for NAS
+        # Measures rank correlation: does the surrogate order architectures correctly?
+        # More robust than R² for low-data regimes and non-linear relationships
+        ktau, _ = kendalltau(acc_true, acc_pred)
+        
+        # R2 score (kept for reference)
         ss_res = np.sum((acc_true - acc_pred) ** 2)
         ss_tot = np.sum((acc_true - acc_true.mean()) ** 2)
         r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
         
-        # MSE
+        # MSE (kept for reference)
         mse = np.mean((acc_true - acc_pred) ** 2)
     
     return {
+        'kendall_tau': ktau,  # Primary metric
         'r2': r2,
         'mse': mse,
         'n_train': sample_size,
@@ -298,8 +306,8 @@ def subsampled_repeated_kfold_comparison(
         print(f"Computing {trials_to_compute} new trials (have {existing_trials}, need {total_trials_needed})")
         
         differences = []  # Store Model1 - Model2 for ONLY NEW trials
-        model1_r2_scores = []  # Track individual model1 R² scores
-        model2_r2_scores = []  # Track individual model2 R² scores
+        model1_ktau_scores = []  # Track individual model1 Kendall's Tau scores
+        model2_ktau_scores = []  # Track individual model2 Kendall's Tau scores
         
         # Start from where we left off
         start_trial = existing_trials
@@ -348,11 +356,13 @@ def subsampled_repeated_kfold_comparison(
                     epochs=epochs, lr=lr, batch_size=batch_size, device=device
                 )
                 
-                # Store individual scores and difference
-                model1_r2_scores.append(result1['r2'])
-                model2_r2_scores.append(result2['r2'])
-                diff_r2 = result1['r2'] - result2['r2']
-                differences.append(diff_r2)
+                # Store individual scores and difference (using Kendall's Tau)
+                score1 = result1['kendall_tau']
+                score2 = result2['kendall_tau']
+                model1_ktau_scores.append(score1)
+                model2_ktau_scores.append(score2)
+                diff_ktau = score1 - score2
+                differences.append(diff_ktau)
                 total_trials += 1
             
             if total_trials >= trials_to_compute:
@@ -378,32 +388,33 @@ def subsampled_repeated_kfold_comparison(
         
         # Combine with existing if present
         new_differences = np.array(differences)
-        model1_r2_array = np.array(model1_r2_scores)
-        model2_r2_array = np.array(model2_r2_scores)
+        model1_ktau_array = np.array(model1_ktau_scores)
+        model2_ktau_array = np.array(model2_ktau_scores)
         
-        # Calculate statistics
-        model1_mean_r2 = np.mean(model1_r2_array)
-        model1_std_r2 = np.std(model1_r2_array)
-        model2_mean_r2 = np.mean(model2_r2_array)
-        model2_std_r2 = np.std(model2_r2_array)
+        # Calculate statistics on Kendall's Tau
+        model1_mean_ktau = np.mean(model1_ktau_array)
+        model1_std_ktau = np.std(model1_ktau_array)
+        model2_mean_ktau = np.mean(model2_ktau_array)
+        model2_std_ktau = np.std(model2_ktau_array)
         mean_diff = np.mean(new_differences)
         std_diff = np.std(new_differences)
         
-        # Perform corrected paired t-test
-        # H0: mean(model1_r2 - model2_r2) = 0 (no difference between models)
-        # H1: mean(model1_r2 - model2_r2) ≠ 0 (significant difference)
+        # Perform corrected paired t-test on Kendall's Tau differences
+        # H0: mean(model1_ktau - model2_ktau) = 0 (no difference in ranking ability)
+        # H1: mean(model1_ktau - model2_ktau) ≠ 0 (significant difference in ranking)
         t_stat, p_value = corrected_paired_ttest(new_differences, n_train, n_test)
         
         results.append({
             'sample_size': sample_size,
             'model1': model1_name,
             'model2': model2_name,
-            'model1_mean_r2': model1_mean_r2,
-            'model1_std_r2': model1_std_r2,
-            'model2_mean_r2': model2_mean_r2,
-            'model2_std_r2': model2_std_r2,
-            'mean_diff_r2': mean_diff,
-            'std_diff_r2': std_diff,
+            'metric': 'kendall_tau',  # Track which metric
+            'model1_mean': model1_mean_ktau,
+            'model1_std': model1_std_ktau,
+            'model2_mean': model2_mean_ktau,
+            'model2_std': model2_std_ktau,
+            'mean_diff': mean_diff,
+            'std_diff': std_diff,
             't_statistic': t_stat,
             'p_value': p_value,
             'significant': p_value < 0.05,
@@ -416,14 +427,14 @@ def subsampled_repeated_kfold_comparison(
         print(f"\n{'='*70}")
         print(f"Results for Sample Size {sample_size}:")
         print(f"{'='*70}")
-        print(f"  {model1_name}: R² = {model1_mean_r2:.4f} ± {model1_std_r2:.4f}")
-        print(f"  {model2_name}: R² = {model2_mean_r2:.4f} ± {model2_std_r2:.4f}")
+        print(f"  {model1_name}: Kendall's Tau = {model1_mean_ktau:.4f} ± {model1_std_ktau:.4f}")
+        print(f"  {model2_name}: Kendall's Tau = {model2_mean_ktau:.4f} ± {model2_std_ktau:.4f}")
         print(f"  Difference (M1-M2): {mean_diff:.4f} ± {std_diff:.4f}")
-        if model1_mean_r2 < 0 or model2_mean_r2 < 0:
-            print(f"  ⚠ Negative R²: Model predicts worse than mean baseline")
+        if model1_mean_ktau < 0 or model2_mean_ktau < 0:
+            print(f"  ⚠ Negative Kendall's Tau: Model has negative rank correlation")
         print(f"\nOne-Tailed Hypothesis Test:")
-        print(f"  H0: model2_R² ≤ model1_R² (model2 not better)")
-        print(f"  H1: model2_R² > model1_R² (model2 is better)")
+        print(f"  H0: model2_Tau ≤ model1_Tau (model2 not better)")
+        print(f"  H1: model2_Tau > model1_Tau (model2 is better)")
         print(f"  t-statistic: {t_stat:.3f}")
         print(f"  p-value (one-tailed): {p_value:.4f}")
         if p_value < 0.05 and t_stat < 0:
