@@ -38,7 +38,7 @@ class MLPSurrogate(nn.Module):
         for hidden_dim in hidden_dims:
             layers.extend([
                 nn.Linear(prev_dim, hidden_dim),
-                nn.ReLU(),
+                nn.LeakyReLU(negative_slope=0.01),
                 nn.Dropout(dropout)
             ])
             prev_dim = hidden_dim
@@ -132,6 +132,7 @@ def train_model_on_subsample(
             outputs = model(batch_X)
             loss = criterion(outputs, batch_y)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
     
     # Evaluation on test set
@@ -148,10 +149,34 @@ def train_model_on_subsample(
         acc_pred = test_pred[:, 1]
         acc_true = test_true[:, 1]
         
+        # Diagnostic checks before computing Kendall's Tau
+        if np.any(np.isnan(acc_pred)):
+            raise ValueError(f"NaN values in predictions! Pred stats: min={np.nanmin(acc_pred)}, max={np.nanmax(acc_pred)}, nan_count={np.sum(np.isnan(acc_pred))}")
+        
+        if np.any(np.isnan(acc_true)):
+            raise ValueError(f"NaN values in ground truth! True stats: min={np.nanmin(acc_true)}, max={np.nanmax(acc_true)}, nan_count={np.sum(np.isnan(acc_true))}")
+        
+        pred_variance = np.var(acc_pred)
+        true_variance = np.var(acc_true)
+        
+        if pred_variance == 0:
+            raise ValueError(f"Zero variance in predictions! All predictions = {acc_pred[0]:.6f}. This indicates model collapse or training failure.")
+        
+        if true_variance == 0:
+            raise ValueError(f"Zero variance in ground truth! All targets = {acc_true[0]:.6f}. This indicates data sampling issue.")
+        
         # Kendall's Tau - PRIMARY METRIC for NAS
         # Measures rank correlation: does the surrogate order architectures correctly?
         # More robust than R² for low-data regimes and non-linear relationships
-        ktau, _ = kendalltau(acc_true, acc_pred)
+        ktau, ktau_pvalue = kendalltau(acc_true, acc_pred)
+        
+        # Check if kendalltau returned NaN (shouldn't happen with valid inputs)
+        if np.isnan(ktau):
+            raise ValueError(f"kendalltau returned NaN!\n"
+                           f"  Pred: min={np.min(acc_pred):.6f}, max={np.max(acc_pred):.6f}, std={np.std(acc_pred):.6f}\n"
+                           f"  True: min={np.min(acc_true):.6f}, max={np.max(acc_true):.6f}, std={np.std(acc_true):.6f}\n"
+                           f"  Unique pred values: {len(np.unique(acc_pred))}, Unique true values: {len(np.unique(acc_true))}\n"
+                           f"  This is a bug - investigate kendalltau behavior with these inputs.")
         
         # R2 score (kept for reference)
         ss_res = np.sum((acc_true - acc_pred) ** 2)
@@ -432,15 +457,31 @@ def subsampled_repeated_kfold_comparison(
         print(f"  Difference (M1-M2): {mean_diff:.4f} ± {std_diff:.4f}")
         if model1_mean_ktau < 0 or model2_mean_ktau < 0:
             print(f"  ⚠ Negative Kendall's Tau: Model has negative rank correlation")
-        print(f"\nOne-Tailed Hypothesis Test:")
-        print(f"  H0: model2_Tau ≤ model1_Tau (model2 not better)")
-        print(f"  H1: model2_Tau > model1_Tau (model2 is better)")
+        
+        # Determine which model is better based on observed difference
+        if mean_diff > 0:
+            # Model1 is better (positive difference)
+            better_model = model1_name
+            worse_model = model2_name
+            print(f"\nOne-Tailed Hypothesis Test:")
+            print(f"  Observed: {model1_name} has higher Kendall's Tau")
+            print(f"  H0: {model1_name}_Tau ≤ {model2_name}_Tau (no real difference)")
+            print(f"  H1: {model1_name}_Tau > {model2_name}_Tau ({model1_name} is genuinely better)")
+        else:
+            # Model2 is better (negative difference)
+            better_model = model2_name
+            worse_model = model1_name
+            print(f"\nOne-Tailed Hypothesis Test:")
+            print(f"  Observed: {model2_name} has higher Kendall's Tau")
+            print(f"  H0: {model2_name}_Tau ≤ {model1_name}_Tau (no real difference)")
+            print(f"  H1: {model2_name}_Tau > {model1_name}_Tau ({model2_name} is genuinely better)")
+        
         print(f"  t-statistic: {t_stat:.3f}")
         print(f"  p-value (one-tailed): {p_value:.4f}")
-        if p_value < 0.05 and t_stat < 0:
-            print(f"  ✓ SIGNIFICANT (p<0.05): {model2_name} is better than {model1_name}")
-        elif p_value < 0.05 and t_stat > 0:
-            print(f"  ✓ SIGNIFICANT (p<0.05): {model1_name} is better than {model2_name}")
+        print(f"  → P-value tests if the observed advantage is statistically significant")
+        
+        if p_value < 0.05:
+            print(f"  ✓ SIGNIFICANT (p<0.05): {better_model} is significantly better than {worse_model}")
         else:
             print(f"  ✗ NOT SIGNIFICANT (p≥0.05): Cannot conclude which is better")
         print(f"{'='*70}")
