@@ -10,6 +10,14 @@ from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
 from generate_corpus import load_corpus
 from embedding_config import MODEL_CONFIGS, get_model_config, FORCE_RECOMPUTE_EMBEDDINGS
 
+# Try to import sentence-transformers (optional)
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    SentenceTransformer = None
+
 def mean_pooling(model_output, attention_mask):
     """
     Perform mean pooling on token embeddings to get sentence embeddings.
@@ -84,7 +92,28 @@ def get_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=20
     
     return np.vstack(all_embeddings)
 
-def embed_with_model(df, model_name, model_display_name, device='cuda', force=None, pytorch_only=False):
+def get_embeddings_sentence_transformers(texts, model, batch_size=16):
+    """
+    Extract embeddings using sentence-transformers library.
+    
+    Args:
+        texts: List of text strings
+        model: SentenceTransformer model
+        batch_size: Batch size for processing
+    
+    Returns:
+        numpy array of embeddings [num_texts, embedding_dim]
+    """
+    # sentence-transformers handles batching and device management internally
+    embeddings = model.encode(
+        texts,
+        batch_size=batch_size,
+        show_progress_bar=True,
+        convert_to_numpy=True
+    )
+    return embeddings
+
+def embed_with_model(df, model_name, model_display_name, device='cuda', force=None, pytorch_only=False, use_sentence_transformers=False):
     """
     Add embeddings from a specific model to the dataframe.
     
@@ -95,6 +124,8 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         device: Device to run model on
         force: If True, force recompute even if embeddings exist. 
                If None, uses FORCE_RECOMPUTE_EMBEDDINGS from config.
+        pytorch_only: If True, only embed pytorch_code
+        use_sentence_transformers: If True, use sentence-transformers library instead of transformers
     
     Returns:
         DataFrame with added embedding columns
@@ -125,30 +156,45 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
     print(f"Model: {model_name}")
     print(f"{'='*80}\n")
     
-    # Load model and tokenizer
-    print(f"Loading {model_display_name} model and tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    
-    # Set padding token if not present (common for decoder-only models like Llama)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    # Use 8-bit quantization for memory efficiency while maintaining good quality
-    quantization_config = BitsAndBytesConfig(
-        load_in_8bit=True,
-        llm_int8_threshold=6.0
-    )
-    
-    model = AutoModel.from_pretrained(
-        model_name,
-        quantization_config=quantization_config,
-        device_map='auto',
-        trust_remote_code=True,
-        use_safetensors=True  # Use safetensors format to avoid torch.load security issues
-    )
-    
-    print(f"Model loaded with 8-bit quantization on {device}")
-    print(f"Model hidden size: {model.config.hidden_size}")
+    if use_sentence_transformers:
+        print(f"Detected sentence-transformers model. Using SentenceTransformer API...")
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            raise ImportError(
+                f"Model {model_name} requires sentence-transformers library but it's not installed. "
+                f"Install with: pip install sentence-transformers"
+            )
+        
+        # Load using sentence-transformers
+        model = SentenceTransformer(model_name, device=device)
+        tokenizer = None  # sentence-transformers handles tokenization internally
+        print(f"Model loaded on {device}")
+        print(f"Model embedding dimension: {model.get_sentence_embedding_dimension()}")
+    else:
+        print(f"Using transformers library with custom mean pooling...")
+        # Load model and tokenizer
+        print(f"Loading {model_display_name} model and tokenizer...")
+        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        
+        # Set padding token if not present (common for decoder-only models like Llama)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Use 8-bit quantization for memory efficiency while maintaining good quality
+        quantization_config = BitsAndBytesConfig(
+            load_in_8bit=True,
+            llm_int8_threshold=6.0
+        )
+        
+        model = AutoModel.from_pretrained(
+            model_name,
+            quantization_config=quantization_config,
+            device_map='auto',
+            trust_remote_code=True,
+            use_safetensors=True  # Use safetensors format to avoid torch.load security issues
+        )
+        
+        print(f"Model loaded with 8-bit quantization on {device}")
+        print(f"Model hidden size: {model.config.hidden_size}")
     
     # Process each representation type
     code_types = ['pytorch_code', 'onnx_code', 'grammar_code']
@@ -158,8 +204,11 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         print(f"\nProcessing {code_type}...")
         texts = df[code_type].tolist()
         
-        # Get embeddings
-        embeddings = get_embeddings(texts, model, tokenizer, device)
+        # Get embeddings using appropriate method
+        if use_sentence_transformers:
+            embeddings = get_embeddings_sentence_transformers(texts, model, batch_size=16)
+        else:
+            embeddings = get_embeddings(texts, model, tokenizer, device)
         
         # Add to dataframe as a column (store as list for each row)
         column_name = f'{model_display_name}_{code_type}_embedding'
@@ -185,7 +234,8 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         pass  # Model might not support .cpu() if quantized
     
     del model
-    del tokenizer
+    if tokenizer is not None:  # tokenizer is None for sentence-transformers
+        del tokenizer
     print("Deleted model and tokenizer objects")
     
     # Force garbage collection
@@ -283,7 +333,8 @@ def embed_corpus(
             df,
             model_config['name'],
             model_config['display_name'],
-            device=device
+            device=device,
+            use_sentence_transformers=model_config.get('sentence_transformer', False)
         )
     
     # Save results
@@ -377,6 +428,7 @@ def add_embeddings_to_corpus(
         model_config['display_name'],
         device=device,
         force=force,
+        use_sentence_transformers=model_config.get('sentence_transformer', False),
         pytorch_only=pytorch_only
     )
     
