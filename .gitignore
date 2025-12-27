@@ -1,3 +1,5 @@
 jahs_bench_data
 **/__pycache__/
 *.out
+logs
+old_logs
