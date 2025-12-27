@@ -12,28 +12,59 @@ FORCE_RERUN_EXPERIMENTS = False     # Set to True to force rerunning existing ex
 MODEL_CONFIGS = [
     {
         'name': 'deepseek-ai/DeepSeek-Coder-V2-Lite-Base',
-        'display_name': 'deepseek_coder'
+        'display_name': 'deepseek_coder',
+        'sentence_transformer': False
     },
     {
         'name': 'answerdotai/ModernBERT-base',
-        'display_name': 'modernbert'
+        'display_name': 'modernbert',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'answerdotai/ModernBERT-large',
+        'display_name': 'modernbert_large',
+        'sentence_transformer': False
     },
     # Add more models here as needed
     {
         'name': 'microsoft/codebert-base',
-        'display_name': 'codebert'
+        'display_name': 'codebert',
+        'sentence_transformer': False
     },
     {
         'name': 'codellama/CodeLlama-34b-hf',
-        'display_name': 'codellama'
+        'display_name': 'codellama',
+        'sentence_transformer': False
     },
     {
         'name': 'codellama/CodeLlama-34b-Python-hf',
-        'display_name': 'codellama_python'
+        'display_name': 'codellama_python',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'codellama/CodeLlama-7b-Python-hf',
+        'display_name': 'codellama_python_7b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'Qwen/Qwen2.5-Coder-0.5B',
+        'display_name': 'qwen_coder_0_5b',
+        'sentence_transformer': False
     },
     {
         'name': 'nomic-ai/CodeRankEmbed',
-        'display_name': 'coderankembed'
+        'display_name': 'coderankembed',
+        'sentence_transformer': True
+    },
+    {
+        'name': 'jinaai/jina-embeddings-v2-base-code',
+        'display_name': 'jina_embed_code',
+        'sentence_transformer': True
+    },
+    {
+        'name': 'codefuse-ai/C2LLM-0.5B',
+        'display_name': 'c2llm_0_5b',
+        'sentence_transformer': True
     },
 ]
 
