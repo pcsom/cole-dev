@@ -165,7 +165,7 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
             )
         
         # Load using sentence-transformers
-        model = SentenceTransformer(model_name, device=device)
+        model = SentenceTransformer(model_name, device=device, trust_remote_code=True)
         tokenizer = None  # sentence-transformers handles tokenization internally
         print(f"Model loaded on {device}")
         print(f"Model embedding dimension: {model.get_sentence_embedding_dimension()}")
