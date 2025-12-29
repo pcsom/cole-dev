@@ -107,7 +107,7 @@ def to_pytorch_code(edges, config):
     lines.append("        return node_3")
     
     # Add JAHS-specific network wrapper with hyperparameters
-    activation_cls = f"nn.{config['Activation']}()" if config['Activation'] != 'ReLU' else "nn.ReLU(inplace=True)"
+    activation_cls = f"nn.{config['Activation']}()"
     N = config['N']
     W = config['W']
     lr = config['LearningRate']
