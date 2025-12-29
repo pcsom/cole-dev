@@ -92,6 +92,102 @@ def get_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=20
     
     return np.vstack(all_embeddings)
 
+def get_echo_embeddings(texts, model, tokenizer, device, batch_size=8, max_length=2048):
+    """
+    Extract Echo Embeddings (Springer et al., 2024).
+    Input: [x, x] (text repeated twice with \n\n separator)
+    Pooling: Mean pooling over the SECOND occurrence only.
+    
+    This method is designed for causal decoder models (CodeLlama, Qwen, etc.)
+    and may not be appropriate for encoder-only models (BERT, ModernBERT).
+    
+    Args:
+        texts: List of text strings
+        model: Transformer model
+        tokenizer: Tokenizer
+        device: Device to run on
+        batch_size: Batch size for processing (smaller due to doubled sequence length)
+        max_length: Maximum sequence length
+    
+    Returns:
+        numpy array of embeddings [num_texts, embedding_dim]
+    """
+    all_embeddings = []
+    
+    # Check model type
+    is_encoder = model.config.is_encoder_decoder if hasattr(model.config, 'is_encoder_decoder') else False
+    if is_encoder or 'bert' in model.config.model_type.lower():
+        print("WARNING: Echo embeddings are designed for causal decoder models (CodeLlama/Qwen).")
+        print("         Using on encoder models (BERT/ModernBERT) is experimental and unproven.")
+    
+    model.eval()
+    with torch.no_grad():
+        for i in tqdm(range(0, len(texts), batch_size), desc="Extracting Echo Embeddings"):
+            batch_texts = texts[i:i+batch_size]
+            
+            # Create echo strings: text + "\n\n" + text
+            echo_texts = [t + "\n\n" + t for t in batch_texts]
+            
+            # Tokenize the full echo strings
+            encoded = tokenizer(
+                echo_texts,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors='pt'
+            )
+            
+            input_ids = encoded['input_ids'].to(device)
+            attention_mask = encoded['attention_mask'].to(device)
+            
+            # Create pooling mask that selects only the second repetition
+            pooling_mask = torch.zeros_like(attention_mask)
+            
+            for b_idx, text in enumerate(batch_texts):
+                # Tokenize just the first part to find the boundary
+                first_part_tokens = tokenizer(text + "\n\n", add_special_tokens=False)['input_ids']
+                first_part_len = len(first_part_tokens)
+                
+                # Get total valid length (excluding padding)
+                total_len = attention_mask[b_idx].sum().item()
+                
+                # The echo part is from first_part_len to end
+                start_idx = min(first_part_len, total_len - 1)
+                end_idx = total_len
+                
+                # Set mask to 1 only for the second occurrence
+                pooling_mask[b_idx, start_idx:end_idx] = 1
+            
+            # Prepare model inputs
+            model_inputs = {
+                'input_ids': input_ids,
+                'attention_mask': attention_mask
+            }
+            
+            if getattr(model.config, 'use_cache', False):
+                model_inputs['use_cache'] = False
+            
+            # Forward pass
+            outputs = model(**model_inputs)
+            
+            # Get last hidden state
+            if hasattr(outputs, 'last_hidden_state'):
+                token_embeddings = outputs.last_hidden_state
+            else:
+                token_embeddings = outputs[0]
+            
+            # Weighted mean pooling using the POOLING MASK (not attention mask)
+            input_mask_expanded = pooling_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            
+            sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+            sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            
+            embeddings = sum_embeddings / sum_mask
+            
+            all_embeddings.append(embeddings.cpu().numpy())
+    
+    return np.vstack(all_embeddings)
+
 def get_embeddings_sentence_transformers(texts, model, batch_size=16):
     """
     Extract embeddings using sentence-transformers library.
@@ -113,7 +209,8 @@ def get_embeddings_sentence_transformers(texts, model, batch_size=16):
     )
     return embeddings
 
-def embed_with_model(df, model_name, model_display_name, device='cuda', force=None, pytorch_only=False, use_sentence_transformers=False):
+def embed_with_model(df, model_name, model_display_name, device='cuda', force=None, pytorch_only=False, 
+                     use_sentence_transformers=False, use_quantization=True, use_echo_embeddings=False):
     """
     Add embeddings from a specific model to the dataframe.
     
@@ -126,6 +223,8 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
                If None, uses FORCE_RECOMPUTE_EMBEDDINGS from config.
         pytorch_only: If True, only embed pytorch_code
         use_sentence_transformers: If True, use sentence-transformers library instead of transformers
+        use_quantization: If True, use 8-bit quantization for transformers models
+        use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
     
     Returns:
         DataFrame with added embedding columns
@@ -170,7 +269,8 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         print(f"Model loaded on {device}")
         print(f"Model embedding dimension: {model.get_sentence_embedding_dimension()}")
     else:
-        print(f"Using transformers library with custom mean pooling...")
+        pooling_method = "echo embeddings" if use_echo_embeddings else "mean pooling"
+        print(f"Using transformers library with custom {pooling_method}...")
         # Load model and tokenizer
         print(f"Loading {model_display_name} model and tokenizer...")
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
@@ -179,21 +279,33 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        # Use 8-bit quantization for memory efficiency while maintaining good quality
-        quantization_config = BitsAndBytesConfig(
-            load_in_8bit=True,
-            llm_int8_threshold=6.0
-        )
+        # Load model with or without quantization
+        if use_quantization:
+            print(f"Using 8-bit quantization for memory efficiency")
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_threshold=6.0
+            )
+            
+            model = AutoModel.from_pretrained(
+                model_name,
+                quantization_config=quantization_config,
+                device_map='auto',
+                trust_remote_code=True,
+                use_safetensors=True
+            )
+            print(f"Model loaded with 8-bit quantization on {device}")
+        else:
+            print(f"Loading model without quantization (full precision)")
+            model = AutoModel.from_pretrained(
+                model_name,
+                device_map='auto',
+                trust_remote_code=True,
+                use_safetensors=True,
+                torch_dtype=torch.float16  # Use fp16 for memory efficiency
+            )
+            print(f"Model loaded in fp16 precision on {device}")
         
-        model = AutoModel.from_pretrained(
-            model_name,
-            quantization_config=quantization_config,
-            device_map='auto',
-            trust_remote_code=True,
-            use_safetensors=True  # Use safetensors format to avoid torch.load security issues
-        )
-        
-        print(f"Model loaded with 8-bit quantization on {device}")
         print(f"Model hidden size: {model.config.hidden_size}")
     
     # Process each representation type
@@ -207,11 +319,14 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         # Get embeddings using appropriate method
         if use_sentence_transformers:
             embeddings = get_embeddings_sentence_transformers(texts, model, batch_size=16)
+        elif use_echo_embeddings:
+            embeddings = get_echo_embeddings(texts, model, tokenizer, device)
         else:
             embeddings = get_embeddings(texts, model, tokenizer, device)
         
         # Add to dataframe as a column (store as list for each row)
-        column_name = f'{model_display_name}_{code_type}_embedding'
+        suffix = '_echo' if use_echo_embeddings else ''
+        column_name = f'{model_display_name}_{code_type}_embedding{suffix}'
         df[column_name] = embeddings.tolist()
         
         print(f"Added column: {column_name}")
@@ -278,7 +393,9 @@ def embed_corpus(
     output_path='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus_embedded_half.pkl',
     device='cuda',
     use_half=True,
-    model_names=None
+    model_names=None,
+    use_echo_embeddings=False,
+    use_quantization=True
 ):
     """
     Embed code representations in the corpus using multiple LLMs.
@@ -289,6 +406,8 @@ def embed_corpus(
         device: Device to run models on
         use_half: If True, only process first half of corpus
         model_names: List of model display names to use. If None, uses all models from config.
+        use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
+        use_quantization: If True, use 8-bit quantization for transformer models (ignored for sentence-transformers)
     
     Returns:
         DataFrame with embeddings
@@ -334,7 +453,9 @@ def embed_corpus(
             model_config['name'],
             model_config['display_name'],
             device=device,
-            use_sentence_transformers=model_config.get('sentence_transformer', False)
+            use_sentence_transformers=model_config.get('sentence_transformer', False),
+            use_quantization=use_quantization,
+            use_echo_embeddings=use_echo_embeddings
         )
     
     # Save results
@@ -370,7 +491,9 @@ def add_embeddings_to_corpus(
     output_path=None,
     device='cuda',
     force=None,
-    pytorch_only=False
+    pytorch_only=False,
+    use_echo_embeddings=False,
+    use_quantization=True
 ):
     """
     Add embeddings from a new model to an existing corpus.
@@ -382,6 +505,9 @@ def add_embeddings_to_corpus(
         device: Device to run model on
         force: If True, force recompute even if embeddings exist.
                If None, uses FORCE_RECOMPUTE_EMBEDDINGS from config.
+        pytorch_only: If True, only embed pytorch_code
+        use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
+        use_quantization: If True, use 8-bit quantization for transformer models (ignored for sentence-transformers)
     
     Returns:
         DataFrame with added embeddings
@@ -429,7 +555,9 @@ def add_embeddings_to_corpus(
         device=device,
         force=force,
         use_sentence_transformers=model_config.get('sentence_transformer', False),
-        pytorch_only=pytorch_only
+        use_quantization=use_quantization,
+        pytorch_only=pytorch_only,
+        use_echo_embeddings=use_echo_embeddings
     )
     
     # Save
