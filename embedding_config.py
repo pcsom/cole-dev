@@ -52,6 +52,16 @@ MODEL_CONFIGS = [
         'sentence_transformer': False
     },
     {
+        'name': 'mistralai/Codestral-22B-v0.1',
+        'display_name': 'codestral_22b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'mistralai/Mamba-Codestral-7B-v0.1',
+        'display_name': 'codestral_7b',
+        'sentence_transformer': False
+    },
+    {
         'name': 'nomic-ai/CodeRankEmbed',
         'display_name': 'coderankembed',
         'sentence_transformer': True
@@ -59,6 +69,11 @@ MODEL_CONFIGS = [
     {
         'name': 'jinaai/jina-embeddings-v2-base-code',
         'display_name': 'jina_embed_code',
+        'sentence_transformer': True
+    },
+    {
+        'name': 'jinaai/jina-code-embeddings-1.5b',
+        'display_name': 'jina_embed_code_1_5b',
         'sentence_transformer': True
     },
     {
