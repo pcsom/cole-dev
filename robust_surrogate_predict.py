@@ -492,6 +492,141 @@ def subsampled_repeated_kfold_comparison(
     return pd.DataFrame(results)
 
 
+def run_cross_corpus_comparison(
+    corpus_path1,
+    corpus_path2,
+    embedding_name1,
+    embedding_name2=None,
+    comparison_label='cross_corpus',
+    sample_sizes=[15, 50, 150, 500, 1500, 5000],
+    n_folds=5,
+    n_repeats=5,
+    benchmark_type='nasbench',
+    output_path=None,
+    device='cuda',
+    force=False
+):
+    """
+    Compare embeddings from TWO different corpus files.
+    Can compare same embedding (e.g., quantized vs non-quantized) or different embeddings.
+    
+    Args:
+        corpus_path1: Path to first corpus pickle
+        corpus_path2: Path to second corpus pickle
+        embedding_name1: Name of embedding in corpus 1 (e.g., 'codestral_7b_pytorch_code_embedding')
+        embedding_name2: Name of embedding in corpus 2 (if None, uses same as embedding_name1)
+        comparison_label: Label for comparison (e.g., 'quant_vs_noquant', 'model_x_vs_y')
+        sample_sizes: List of training sizes for learning curve
+        n_folds: Number of CV folds
+        n_repeats: Number of CV repeats
+        benchmark_type: 'nasbench' or 'jahs'
+        output_path: Path to save results
+        device: Device to use
+        force: If True, recompute all comparisons regardless of existing results
+    
+    Returns:
+        DataFrame with comparison results
+    """
+    # Default to same embedding in both corpora if not specified
+    if embedding_name2 is None:
+        embedding_name2 = embedding_name1
+    
+    print(f"\n{'='*80}")
+    print(f"Cross-Corpus Comparison: {comparison_label}")
+    print(f"{'='*80}")
+    print(f"Corpus 1: {corpus_path1}")
+    print(f"  Embedding: {embedding_name1}")
+    print(f"Corpus 2: {corpus_path2}")
+    print(f"  Embedding: {embedding_name2}")
+    print(f"{'='*80}\n")
+    
+    # Load both corpora
+    print(f"Loading corpus 1 from {corpus_path1}...")
+    df1 = pd.read_pickle(corpus_path1)
+    print(f"  Loaded {len(df1)} architectures")
+    
+    print(f"Loading corpus 2 from {corpus_path2}...")
+    df2 = pd.read_pickle(corpus_path2)
+    print(f"  Loaded {len(df2)} architectures")
+    
+    # Verify same architectures in same order
+    if len(df1) != len(df2):
+        raise ValueError(f"Corpus sizes don't match: {len(df1)} vs {len(df2)}")
+    
+    # Check if both have the embeddings
+    if embedding_name1 not in df1.columns:
+        raise ValueError(f"Embedding '{embedding_name1}' not found in corpus 1")
+    if embedding_name2 not in df2.columns:
+        raise ValueError(f"Embedding '{embedding_name2}' not found in corpus 2")
+    
+    # Check existing results
+    existing_results = None
+    if output_path and os.path.exists(output_path) and not force:
+        print(f"\nLoading existing results from {output_path}...")
+        existing_results = pd.read_csv(output_path)
+        print(f"  Found {len(existing_results)} existing rows")
+    
+    # Prepare targets (use corpus 1, should be identical in both)
+    if benchmark_type == 'nasbench':
+        y = df1[['cifar10-valid_valid_loss', 'cifar10-valid_valid_accuracy']].values.astype(np.float32)
+    elif benchmark_type == 'jahs':
+        y = df1[['test_acc', 'valid_acc']].values.astype(np.float32)
+    else:
+        raise ValueError(f"Unknown benchmark_type: {benchmark_type}")
+    
+    print(f"Targets shape: {y.shape}, dtype: {y.dtype}")
+    
+    # Extract embeddings from both corpora
+    X1 = np.array(df1[embedding_name1].tolist()).astype(np.float32)
+    X2 = np.array(df2[embedding_name2].tolist()).astype(np.float32)
+    
+    print(f"\nEmbeddings from corpus 1 ({embedding_name1}): {X1.shape}, dtype {X1.dtype}")
+    print(f"Embeddings from corpus 2 ({embedding_name2}): {X2.shape}, dtype {X2.dtype}")
+    
+    # Create model names
+    model1_name = f"{embedding_name1}_corpus1"
+    model2_name = f"{embedding_name2}_corpus2"
+    
+    # Prepare X dict for comparison function
+    X = {model1_name: X1, model2_name: X2}
+    embedding_types = [model1_name, model2_name]
+    
+    # Run comparison
+    result_df = subsampled_repeated_kfold_comparison(
+        X, y, embedding_types,
+        sample_sizes=sample_sizes,
+        n_folds=n_folds,
+        n_repeats=n_repeats,
+        model1_idx=0,
+        model2_idx=1,
+        device=device,
+        existing_results=existing_results,
+        pairs_to_compute=None
+    )
+    
+    # Add comparison metadata
+    result_df['comparison_type'] = comparison_label
+    result_df['embedding1'] = embedding_name1
+    result_df['embedding2'] = embedding_name2
+    result_df['corpus1'] = corpus_path1
+    result_df['corpus2'] = corpus_path2
+    
+    # MERGE with existing results
+    if existing_results is not None:
+        final_results = pd.concat([existing_results, result_df], ignore_index=True)
+        print(f"\n  Merged into {len(final_results)} total rows ({len(result_df)} new)")
+    else:
+        final_results = result_df
+    
+    # Save results
+    if output_path:
+        print(f"\nSaving results to {output_path}...")
+        final_results.to_csv(output_path, index=False)
+        print("Results saved!")
+    
+    return final_results
+
+
 def run_robust_comparison(
     corpus_path,
     embedding_types,
