@@ -498,10 +498,16 @@ def add_embeddings_to_corpus(
     """
     Add embeddings from a new model to an existing corpus.
     
+    This function:
+    1. Loads source corpus from corpus_path (for code text)
+    2. Loads output corpus from output_path (if exists) to preserve existing embeddings
+    3. Adds only the new embedding columns
+    4. Saves to output_path
+    
     Args:
-        corpus_path: Path to existing corpus (with or without embeddings)
+        corpus_path: Path to source corpus (must have code columns like pytorch_code)
         model_name: Display name of model to add (must be in embedding_config.py)
-        output_path: Path to save updated corpus. If None, overwrites input.
+        output_path: Path to save updated corpus. If None, overwrites corpus_path.
         device: Device to run model on
         force: If True, force recompute even if embeddings exist.
                If None, uses FORCE_RECOMPUTE_EMBEDDINGS from config.
@@ -516,26 +522,43 @@ def add_embeddings_to_corpus(
         force = FORCE_RECOMPUTE_EMBEDDINGS
     
     print(f"{'='*80}")
-    print(f"Adding embeddings from {model_name} to existing corpus")
+    print(f"Adding embeddings from {model_name}")
     print(f"{'='*80}\n")
     
-    # Load existing corpus
-    print(f"Loading corpus from {corpus_path}...")
-    df = pd.read_pickle(corpus_path)
-    print(f"Loaded {len(df)} architectures")
-    print(f"Existing columns: {list(df.columns)}\n")
+    # Determine output path
+    if output_path is None:
+        output_path = corpus_path
     
-    # Check if embeddings already exist
-    embedding_cols = [col for col in df.columns if f'{model_name}_' in col and 'embedding' in col]
+    # Load source corpus for code text
+    print(f"Loading source corpus (for code text) from {corpus_path}...")
+    df_source = pd.read_pickle(corpus_path)
+    print(f"  Loaded {len(df_source)} architectures")
+    
+    # Load or initialize output corpus
+    if os.path.exists(output_path) and output_path != corpus_path:
+        print(f"Loading existing output corpus from {output_path}...")
+        df_output = pd.read_pickle(output_path)
+        print(f"  Loaded {len(df_output)} architectures")
+        print(f"  Existing columns: {list(df_output.columns)}")
+        
+        # Verify same architectures
+        if len(df_source) != len(df_output):
+            raise ValueError(f"Source and output corpus sizes don't match: {len(df_source)} vs {len(df_output)}")
+    else:
+        print(f"Output corpus doesn't exist or same as source, will create new")
+        df_output = df_source.copy()
+    
+    # Check if embeddings already exist in OUTPUT corpus
+    embedding_cols = [col for col in df_output.columns if f'{model_name}_' in col and 'embedding' in col]
     if embedding_cols and not force:
-        print(f"INFO: Embeddings for {model_name} already exist: {embedding_cols}")
+        print(f"\nINFO: Embeddings for {model_name} already exist in output: {embedding_cols}")
         print(f"Skipping embedding computation (set force=True or FORCE_RECOMPUTE_EMBEDDINGS=True to override)")
-        return df
+        return df_output
     
     if embedding_cols and force:
-        print(f"WARNING: Overwriting existing embeddings for {model_name}: {embedding_cols}")
-        df = df.drop(columns=embedding_cols)
-        print(f"Dropped existing embedding columns")
+        print(f"\nWARNING: Overwriting existing embeddings for {model_name}: {embedding_cols}")
+        df_output = df_output.drop(columns=embedding_cols)
+        print(f"Dropped existing embedding columns from output")
     
     # Get model config
     model_config = get_model_config(model_name)
@@ -547,9 +570,11 @@ def add_embeddings_to_corpus(
         print("WARNING: CUDA not available, falling back to CPU")
         device = 'cpu'
     
-    # Add embeddings
-    df = embed_with_model(
-        df,
+    print(f"\nEmbedding with {model_name}...")
+    
+    # Add embeddings (use SOURCE corpus for code text)
+    df_with_new_embeddings = embed_with_model(
+        df_source,
         model_config['name'],
         model_config['display_name'],
         device=device,
@@ -560,25 +585,33 @@ def add_embeddings_to_corpus(
         use_echo_embeddings=use_echo_embeddings
     )
     
-    # Save
-    if output_path is None:
-        output_path = corpus_path
+    # Extract only the NEW embedding columns
+    new_embedding_cols = [col for col in df_with_new_embeddings.columns 
+                         if f'{model_name}_' in col and 'embedding' in col]
     
+    print(f"\nNew embedding columns to add: {new_embedding_cols}")
+    
+    # Add new columns to output corpus
+    for col in new_embedding_cols:
+        df_output[col] = df_with_new_embeddings[col]
+    
+    # Save
     print(f"\n{'='*80}")
     print("Saving updated corpus...")
     print(f"{'='*80}\n")
     
     print(f"Saving to {output_path}")
-    df.to_pickle(output_path)
+    df_output.to_pickle(output_path)
     
     csv_path = output_path.replace('.pkl', '.csv')
     print(f"Saving CSV version to {csv_path}")
-    df.to_csv(csv_path, index=False)
+    df_output.to_csv(csv_path, index=False)
     
     print(f"\nUpdate complete!")
-    print(f"Final DataFrame shape: {df.shape}")
+    print(f"Final DataFrame shape: {df_output.shape}")
+    print(f"Final columns: {list(df_output.columns)}")
     
-    return df
+    return df_output
 
 if __name__ == "__main__":
     # Check for GPU
