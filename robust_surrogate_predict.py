@@ -331,6 +331,14 @@ def subsampled_repeated_kfold_comparison(
         differences = []  # Store Model1 - Model2 for ONLY NEW trials
         model1_ktau_scores = []  # Track individual model1 Kendall's Tau scores
         model2_ktau_scores = []  # Track individual model2 Kendall's Tau scores
+        model1_r2_scores = []  # Track individual model1 R² scores
+        model2_r2_scores = []  # Track individual model2 R² scores
+        model1_mse_scores = []  # Track individual model1 MSE scores
+        model2_mse_scores = []  # Track individual model2 MSE scores
+        
+        differences_ktau = []  # Store Model1 - Model2 Kendall's Tau differences
+        differences_r2 = []  # Store Model1 - Model2 R² differences
+        differences_mse = []  # Store Model1 - Model2 MSE differences
         
         # Start from where we left off
         start_trial = existing_trials
@@ -386,6 +394,19 @@ def subsampled_repeated_kfold_comparison(
                 model2_ktau_scores.append(score2)
                 diff_ktau = score1 - score2
                 differences.append(diff_ktau)
+                differences_ktau.append(diff_ktau)
+                
+                # Also store R² and MSE scores and differences
+                model1_r2_scores.append(result1['r2'])
+                model2_r2_scores.append(result2['r2'])
+                diff_r2 = result1['r2'] - result2['r2']
+                differences_r2.append(diff_r2)
+                
+                model1_mse_scores.append(result1['mse'])
+                model2_mse_scores.append(result2['mse'])
+                diff_mse = result1['mse'] - result2['mse']
+                differences_mse.append(diff_mse)
+                
                 total_trials += 1
             
             if total_trials >= trials_to_compute:
@@ -411,21 +432,44 @@ def subsampled_repeated_kfold_comparison(
         
         # Combine with existing if present
         new_differences = np.array(differences)
+        new_differences_ktau = np.array(differences_ktau)
+        new_differences_r2 = np.array(differences_r2)
+        new_differences_mse = np.array(differences_mse)
+        
         model1_ktau_array = np.array(model1_ktau_scores)
         model2_ktau_array = np.array(model2_ktau_scores)
+        model1_r2_array = np.array(model1_r2_scores)
+        model2_r2_array = np.array(model2_r2_scores)
+        model1_mse_array = np.array(model1_mse_scores)
+        model2_mse_array = np.array(model2_mse_scores)
         
         # Calculate statistics on Kendall's Tau
         model1_mean_ktau = np.mean(model1_ktau_array)
         model1_std_ktau = np.std(model1_ktau_array)
         model2_mean_ktau = np.mean(model2_ktau_array)
         model2_std_ktau = np.std(model2_ktau_array)
-        mean_diff = np.mean(new_differences)
-        std_diff = np.std(new_differences)
+        mean_diff_ktau = np.mean(new_differences_ktau)
+        std_diff_ktau = np.std(new_differences_ktau)
         
-        # Perform corrected paired t-test on Kendall's Tau differences
-        # H0: mean(model1_ktau - model2_ktau) = 0 (no difference in ranking ability)
-        # H1: mean(model1_ktau - model2_ktau) ≠ 0 (significant difference in ranking)
-        t_stat, p_value = corrected_paired_ttest(new_differences, n_train, n_test)
+        # Calculate statistics on R² and MSE
+        model1_mean_r2 = np.mean(model1_r2_array)
+        model1_std_r2 = np.std(model1_r2_array)
+        model2_mean_r2 = np.mean(model2_r2_array)
+        model2_std_r2 = np.std(model2_r2_array)
+        mean_diff_r2 = np.mean(new_differences_r2)
+        std_diff_r2 = np.std(new_differences_r2)
+        
+        model1_mean_mse = np.mean(model1_mse_array)
+        model1_std_mse = np.std(model1_mse_array)
+        model2_mean_mse = np.mean(model2_mse_array)
+        model2_std_mse = np.std(model2_mse_array)
+        mean_diff_mse = np.mean(new_differences_mse)
+        std_diff_mse = np.std(new_differences_mse)
+        
+        # Perform corrected paired t-test on all three metrics
+        t_stat_ktau, p_value_ktau = corrected_paired_ttest(new_differences_ktau, n_train, n_test)
+        t_stat_r2, p_value_r2 = corrected_paired_ttest(new_differences_r2, n_train, n_test)
+        t_stat_mse, p_value_mse = corrected_paired_ttest(new_differences_mse, n_train, n_test)
         
         results.append({
             'sample_size': sample_size,
@@ -436,58 +480,103 @@ def subsampled_repeated_kfold_comparison(
             'model1_std': model1_std_ktau,
             'model2_mean': model2_mean_ktau,
             'model2_std': model2_std_ktau,
-            'mean_diff': mean_diff,
-            'std_diff': std_diff,
-            't_statistic': t_stat,
-            'p_value': p_value,
-            'significant': p_value < 0.05,
+            'mean_diff': mean_diff_ktau,
+            'std_diff': std_diff_ktau,
+            't_statistic': t_stat_ktau,
+            'p_value': p_value_ktau,
+            'significant': p_value_ktau < 0.05,
             'n_trials': len(new_differences),  # Only NEW trials
             'n_train_actual': n_train,
-            'n_test_actual': n_test
+            'n_test_actual': n_test,
+            # R² statistics and significance
+            'model1_mean_r2': model1_mean_r2,
+            'model1_std_r2': model1_std_r2,
+            'model2_mean_r2': model2_mean_r2,
+            'model2_std_r2': model2_std_r2,
+            'mean_diff_r2': mean_diff_r2,
+            'std_diff_r2': std_diff_r2,
+            't_statistic_r2': t_stat_r2,
+            'p_value_r2': p_value_r2,
+            'significant_r2': p_value_r2 < 0.05,
+            # MSE statistics and significance
+            'model1_mean_mse': model1_mean_mse,
+            'model1_std_mse': model1_std_mse,
+            'model2_mean_mse': model2_mean_mse,
+            'model2_std_mse': model2_std_mse,
+            'mean_diff_mse': mean_diff_mse,
+            'std_diff_mse': std_diff_mse,
+            't_statistic_mse': t_stat_mse,
+            'p_value_mse': p_value_mse,
+            'significant_mse': p_value_mse < 0.05
         })
         
         # Detailed reporting
         print(f"\n{'='*70}")
         print(f"Results for Sample Size {sample_size}:")
         print(f"{'='*70}")
-        print(f"  {model1_name}: Kendall's Tau = {model1_mean_ktau:.4f} ± {model1_std_ktau:.4f}")
-        print(f"  {model2_name}: Kendall's Tau = {model2_mean_ktau:.4f} ± {model2_std_ktau:.4f}")
-        print(f"  Difference (M1-M2): {mean_diff:.4f} ± {std_diff:.4f}")
+        print(f"  {model1_name}:")
+        print(f"    Kendall's Tau = {model1_mean_ktau:.4f} ± {model1_std_ktau:.4f}")
+        print(f"    R² = {model1_mean_r2:.4f} ± {model1_std_r2:.4f}")
+        print(f"    MSE = {model1_mean_mse:.4f} ± {model1_std_mse:.4f}")
+        print(f"  {model2_name}:")
+        print(f"    Kendall's Tau = {model2_mean_ktau:.4f} ± {model2_std_ktau:.4f}")
+        print(f"    R² = {model2_mean_r2:.4f} ± {model2_std_r2:.4f}")
+        print(f"    MSE = {model2_mean_mse:.4f} ± {model2_std_mse:.4f}")
+        print(f"  Difference (M1-M2): {mean_diff_ktau:.4f} ± {std_diff_ktau:.4f}")
         if model1_mean_ktau < 0 or model2_mean_ktau < 0:
             print(f"  ⚠ Negative Kendall's Tau: Model has negative rank correlation")
         
         # Determine which model is better based on observed difference
-        if mean_diff > 0:
+        if mean_diff_ktau > 0:
             # Model1 is better (positive difference)
-            better_model = model1_name
-            worse_model = model2_name
-            print(f"\nOne-Tailed Hypothesis Test:")
+            better_model_ktau = model1_name
+            worse_model_ktau = model2_name
+            print(f"\nOne-Tailed Hypothesis Test (Kendall's Tau):")
             print(f"  Observed: {model1_name} has higher Kendall's Tau")
             print(f"  H0: {model1_name}_Tau ≤ {model2_name}_Tau (no real difference)")
             print(f"  H1: {model1_name}_Tau > {model2_name}_Tau ({model1_name} is genuinely better)")
         else:
             # Model2 is better (negative difference)
-            better_model = model2_name
-            worse_model = model1_name
-            print(f"\nOne-Tailed Hypothesis Test:")
+            better_model_ktau = model2_name
+            worse_model_ktau = model1_name
+            print(f"\nOne-Tailed Hypothesis Test (Kendall's Tau):")
             print(f"  Observed: {model2_name} has higher Kendall's Tau")
             print(f"  H0: {model2_name}_Tau ≤ {model1_name}_Tau (no real difference)")
             print(f"  H1: {model2_name}_Tau > {model1_name}_Tau ({model2_name} is genuinely better)")
         
-        print(f"  t-statistic: {t_stat:.3f}")
-        print(f"  p-value (one-tailed): {p_value:.4f}")
+        print(f"  t-statistic: {t_stat_ktau:.3f}")
+        print(f"  p-value (one-tailed): {p_value_ktau:.4f}")
         print(f"  → P-value tests if the observed advantage is statistically significant")
         
-        if p_value < 0.05:
-            print(f"  ✓ SIGNIFICANT (p<0.05): {better_model} is significantly better than {worse_model}")
+        if p_value_ktau < 0.05:
+            print(f"  ✓ SIGNIFICANT (p<0.05): {better_model_ktau} is significantly better than {worse_model_ktau}")
         else:
             print(f"  ✗ NOT SIGNIFICANT (p≥0.05): Cannot conclude which is better")
+        
+        # R² significance test
+        print(f"\nOne-Tailed Hypothesis Test (R²):")
+        print(f"  Difference (M1-M2): {mean_diff_r2:.4f} ± {std_diff_r2:.4f}")
+        print(f"  t-statistic: {t_stat_r2:.3f}, p-value: {p_value_r2:.4f}")
+        if p_value_r2 < 0.05:
+            better_model_r2 = model1_name if mean_diff_r2 > 0 else model2_name
+            worse_model_r2 = model2_name if mean_diff_r2 > 0 else model1_name
+            print(f"  ✓ SIGNIFICANT (p<0.05): {better_model_r2} is significantly better than {worse_model_r2}")
+        else:
+            print(f"  ✗ NOT SIGNIFICANT (p≥0.05): Cannot conclude which is better")
+        
+        # MSE significance test
+        print(f"\nOne-Tailed Hypothesis Test (MSE):")
+        print(f"  Difference (M1-M2): {mean_diff_mse:.4f} ± {std_diff_mse:.4f}")
+        print(f"  t-statistic: {t_stat_mse:.3f}, p-value: {p_value_mse:.4f}")
+        if p_value_mse < 0.05:
+            # For MSE, lower is better, so reverse the logic
+            better_model_mse = model2_name if mean_diff_mse > 0 else model1_name
+            worse_model_mse = model1_name if mean_diff_mse > 0 else model2_name
+            print(f"  ✓ SIGNIFICANT (p<0.05): {better_model_mse} is significantly better than {worse_model_mse}")
+        else:
+            print(f"  ✗ NOT SIGNIFICANT (p≥0.05): Cannot conclude which is better")
+        
         print(f"{'='*70}")
-        
-        
-        print(f"New trials - Mean Diff (R²): {mean_diff:.4f} ± {std_diff:.4f}")
-        print(f"t-statistic: {t_stat:.3f}, p-value: {p_value:.4f}")
-        print(f"Significant: {p_value < 0.05}")
     
     return pd.DataFrame(results)
 
