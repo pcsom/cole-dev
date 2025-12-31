@@ -203,7 +203,8 @@ def subsampled_repeated_kfold_comparison(
     device='cuda',
     random_state=42,
     pairs_to_compute=None,
-    trial_data_dict=None
+    trial_data_dict=None,
+    existing_trials_dict=None
 ):
     """
     Perform subsampled repeated k-fold CV with corrected statistical testing.
@@ -259,9 +260,9 @@ def subsampled_repeated_kfold_comparison(
     for sample_size in sample_sizes:
         print(f"\n--- Sample Size: {sample_size} ---")
         
-        # Determine how many trials already exist from trial_data_dict (Type 1 CSVs)
-        existing_trials_m1 = len(trial_data_dict.get(model1_name, {}).get(sample_size, []))
-        existing_trials_m2 = len(trial_data_dict.get(model2_name, {}).get(sample_size, []))
+        # Determine how many trials already exist from existing_trials_dict (loaded from Type 1 CSVs)
+        existing_trials_m1 = len(existing_trials_dict.get(model1_name, {}).get(sample_size, []))
+        existing_trials_m2 = len(existing_trials_dict.get(model2_name, {}).get(sample_size, []))
         existing_trials = min(existing_trials_m1, existing_trials_m2)  # Both models must have same trials
         
         total_trials_needed = n_folds * n_repeats
@@ -344,7 +345,7 @@ def subsampled_repeated_kfold_comparison(
                 diff_mse = result1['mse'] - result2['mse']
                 differences_mse.append(diff_mse)
                 
-                # Track individual trial data for Type 1 CSV saving
+                # Track individual NEW trial data for Type 1 CSV saving
                 if trial_data_dict is not None:
                     # Initialize dicts for model1 and model2 if not present
                     if model1_name not in trial_data_dict:
@@ -358,7 +359,7 @@ def subsampled_repeated_kfold_comparison(
                     if sample_size not in trial_data_dict[model2_name]:
                         trial_data_dict[model2_name][sample_size] = []
                     
-                    # Append trial data: (fold, repeat, ktau, mse)
+                    # Append NEW trial data: (fold, repeat, ktau, mse)
                     trial_data_dict[model1_name][sample_size].append(
                         (fold_idx, repeat, result1['kendall_tau'], result1['mse'])
                     )
@@ -375,9 +376,14 @@ def subsampled_repeated_kfold_comparison(
         n_train = len(pool_idx)
         n_test = len(test_idx)
         
-        # Get ALL trials from trial_data_dict (existing + new)
-        all_model1_trials = trial_data_dict.get(model1_name, {}).get(sample_size, [])
-        all_model2_trials = trial_data_dict.get(model2_name, {}).get(sample_size, [])
+        # Combine existing trials with new trials for statistics calculation
+        existing_m1_trials = existing_trials_dict.get(model1_name, {}).get(sample_size, [])
+        existing_m2_trials = existing_trials_dict.get(model2_name, {}).get(sample_size, [])
+        new_m1_trials = trial_data_dict.get(model1_name, {}).get(sample_size, [])
+        new_m2_trials = trial_data_dict.get(model2_name, {}).get(sample_size, [])
+        
+        all_model1_trials = existing_m1_trials + new_m1_trials
+        all_model2_trials = existing_m2_trials + new_m2_trials
         
         # Extract metrics from all trials: (fold_idx, repeat, ktau, mse)
         all_model1_ktau = [t[2] for t in all_model1_trials]  # index 2 is ktau
@@ -628,18 +634,19 @@ def run_comparison(
     print(f"{'='*80}\n")
     
     # Load existing trials from Type 1 CSVs
-    trial_data_dict = {}
+    existing_trials_dict = {}  # Existing trials loaded from disk
+    new_trials_dict = {}  # New trials to be computed and saved
     if not force and per_embedding_output_dir:
         print(f"Loading existing trials from Type 1 CSVs...")
-        trial_data_dict[model1_name] = load_existing_trials(
+        existing_trials_dict[model1_name] = load_existing_trials(
             per_embedding_output_dir, embedding1_name, corpus1_name
         )
-        trial_data_dict[model2_name] = load_existing_trials(
+        existing_trials_dict[model2_name] = load_existing_trials(
             per_embedding_output_dir, embedding2_name, corpus2_name
         )
         
-        total_m1 = sum(len(trials) for trials in trial_data_dict[model1_name].values())
-        total_m2 = sum(len(trials) for trials in trial_data_dict[model2_name].values())
+        total_m1 = sum(len(trials) for trials in existing_trials_dict[model1_name].values())
+        total_m2 = sum(len(trials) for trials in existing_trials_dict[model2_name].values())
         print(f"  {model1_name}: {total_m1} existing trials")
         print(f"  {model2_name}: {total_m2} existing trials")
     
@@ -647,7 +654,7 @@ def run_comparison(
     X = {model1_name: X1, model2_name: X2}
     embedding_types = [model1_name, model2_name]
     
-    # Run comparison
+    # Run comparison (new_trials_dict will be populated with NEW trials only)
     result_df = subsampled_repeated_kfold_comparison(
         X, y, embedding_types,
         sample_sizes=sample_sizes,
@@ -657,7 +664,8 @@ def run_comparison(
         model2_idx=1,
         device=device,
         pairs_to_compute=None,
-        trial_data_dict=trial_data_dict
+        trial_data_dict=new_trials_dict,
+        existing_trials_dict=existing_trials_dict
     )
     
     # Add metadata
@@ -667,8 +675,8 @@ def run_comparison(
     result_df['corpus1'] = corpus1_name
     result_df['corpus2'] = corpus2_name
     
-    # Split and save results
-    per_embedding_dict, comparison_df = split_results_for_saving(result_df, trial_data_dict)
+    # Split and save results - use new_trials_dict which contains ONLY new trials
+    per_embedding_dict, comparison_df = split_results_for_saving(result_df, new_trials_dict)
     
     # Save Type 1: Per-embedding results (only NEW trials)
     if per_embedding_output_dir:
