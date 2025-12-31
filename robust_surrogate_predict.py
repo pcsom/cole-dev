@@ -24,6 +24,7 @@ import scipy.stats as stats
 from scipy.stats import kendalltau
 from typing import List, Dict, Optional, Tuple
 import os
+from results_io import save_per_embedding_results, save_comparison_results, split_results_for_saving
 
 
 class MLPSurrogate(nn.Module):
@@ -250,7 +251,8 @@ def subsampled_repeated_kfold_comparison(
     device='cuda',
     random_state=42,
     existing_results=None,
-    pairs_to_compute=None
+    pairs_to_compute=None,
+    trial_data_dict=None
 ):
     """
     Perform subsampled repeated k-fold CV with corrected statistical testing.
@@ -406,6 +408,28 @@ def subsampled_repeated_kfold_comparison(
                 model2_mse_scores.append(result2['mse'])
                 diff_mse = result1['mse'] - result2['mse']
                 differences_mse.append(diff_mse)
+                
+                # Track individual trial data for Type 1 CSV saving
+                if trial_data_dict is not None:
+                    # Initialize dicts for model1 and model2 if not present
+                    if model1_name not in trial_data_dict:
+                        trial_data_dict[model1_name] = {}
+                    if model2_name not in trial_data_dict:
+                        trial_data_dict[model2_name] = {}
+                    
+                    # Initialize sample_size list if not present
+                    if sample_size not in trial_data_dict[model1_name]:
+                        trial_data_dict[model1_name][sample_size] = []
+                    if sample_size not in trial_data_dict[model2_name]:
+                        trial_data_dict[model2_name][sample_size] = []
+                    
+                    # Append trial data: (trial_num, ktau, r2, mse)
+                    trial_data_dict[model1_name][sample_size].append(
+                        (trial_number, result1['kendall_tau'], result1['r2'], result1['mse'])
+                    )
+                    trial_data_dict[model2_name][sample_size].append(
+                        (trial_number, result2['kendall_tau'], result2['r2'], result2['mse'])
+                    )
                 
                 total_trials += 1
             
@@ -591,7 +615,8 @@ def run_cross_corpus_comparison(
     n_folds=5,
     n_repeats=5,
     benchmark_type='nasbench',
-    output_path=None,
+    comparison_output_path=None,
+    per_embedding_output_dir=None,
     device='cuda',
     force=False
 ):
@@ -609,7 +634,8 @@ def run_cross_corpus_comparison(
         n_folds: Number of CV folds
         n_repeats: Number of CV repeats
         benchmark_type: 'nasbench' or 'jahs'
-        output_path: Path to save results
+        comparison_output_path: Path to save global comparison CSV (Type 2)
+        per_embedding_output_dir: Directory to save per-embedding CSVs (Type 1)
         device: Device to use
         force: If True, recompute all comparisons regardless of existing results
     
@@ -648,12 +674,12 @@ def run_cross_corpus_comparison(
     if embedding_name2 not in df2.columns:
         raise ValueError(f"Embedding '{embedding_name2}' not found in corpus 2")
     
-    # Check existing results
+    # Check existing comparison results
     existing_results = None
-    if output_path and os.path.exists(output_path) and not force:
-        print(f"\nLoading existing results from {output_path}...")
-        existing_results = pd.read_csv(output_path)
-        print(f"  Found {len(existing_results)} existing rows")
+    if comparison_output_path and os.path.exists(comparison_output_path) and not force:
+        print(f"\nLoading existing comparison results from {comparison_output_path}...")
+        existing_results = pd.read_csv(comparison_output_path)
+        print(f"  Found {len(existing_results)} existing comparison rows")
     
     # Prepare targets (use corpus 1, should be identical in both)
     if benchmark_type == 'nasbench':
@@ -680,6 +706,9 @@ def run_cross_corpus_comparison(
     X = {model1_name: X1, model2_name: X2}
     embedding_types = [model1_name, model2_name]
     
+    # Initialize trial data tracking for Type 1 CSV
+    trial_data_dict = {}
+    
     # Run comparison
     result_df = subsampled_repeated_kfold_comparison(
         X, y, embedding_types,
@@ -690,7 +719,8 @@ def run_cross_corpus_comparison(
         model2_idx=1,
         device=device,
         existing_results=existing_results,
-        pairs_to_compute=None
+        pairs_to_compute=None,
+        trial_data_dict=trial_data_dict
     )
     
     # Add comparison metadata
@@ -700,20 +730,21 @@ def run_cross_corpus_comparison(
     result_df['corpus1'] = corpus_path1
     result_df['corpus2'] = corpus_path2
     
-    # MERGE with existing results
-    if existing_results is not None:
-        final_results = pd.concat([existing_results, result_df], ignore_index=True)
-        print(f"\n  Merged into {len(final_results)} total rows ({len(result_df)} new)")
-    else:
-        final_results = result_df
+    # Split results for Type 1 and Type 2 saving
+    per_embedding_dict, comparison_df = split_results_for_saving(result_df, trial_data_dict)
     
-    # Save results
-    if output_path:
-        print(f"\nSaving results to {output_path}...")
-        final_results.to_csv(output_path, index=False)
-        print("Results saved!")
+    # Save Type 1: Per-embedding results
+    if per_embedding_output_dir:
+        print(f"\nSaving per-embedding results (Type 1)...")
+        for embedding_name, emb_df in per_embedding_dict.items():
+            save_per_embedding_results(emb_df, per_embedding_output_dir, embedding_name)
     
-    return final_results
+    # Save Type 2: Comparison results (always appends)
+    if comparison_output_path:
+        print(f"\nSaving comparison results (Type 2)...")
+        save_comparison_results(comparison_df, comparison_output_path)
+    
+    return result_df
 
 
 def run_robust_comparison(
@@ -723,7 +754,8 @@ def run_robust_comparison(
     n_folds=5,
     n_repeats=5,
     benchmark_type='nasbench',  # 'nasbench' or 'jahs'
-    output_path=None,
+    comparison_output_path=None,
+    per_embedding_output_dir=None,
     device='cuda',
     force=False
 ):
@@ -738,7 +770,8 @@ def run_robust_comparison(
         n_folds: Number of CV folds
         n_repeats: Number of CV repeats
         benchmark_type: 'nasbench' or 'jahs'
-        output_path: Path to save results
+        comparison_output_path: Path to save global comparison CSV (Type 2)
+        per_embedding_output_dir: Directory to save per-embedding CSVs (Type 1)
         device: Device to use
         force: If True, recompute all comparisons regardless of existing results
     
@@ -749,12 +782,12 @@ def run_robust_comparison(
     df = pd.read_pickle(corpus_path)
     print(f"Loaded {len(df)} architectures")
     
-    # Check existing results
+    # Check existing comparison results
     existing_results = None
-    if output_path and os.path.exists(output_path) and not force:
-        print(f"\nLoading existing results from {output_path}...")
-        existing_results = pd.read_csv(output_path)
-        print(f"  Found {len(existing_results)} existing rows")
+    if comparison_output_path and os.path.exists(comparison_output_path) and not force:
+        print(f"\nLoading existing comparison results from {comparison_output_path}...")
+        existing_results = pd.read_csv(comparison_output_path)
+        print(f"  Found {len(existing_results)} existing comparison rows")
         print(f"  Existing columns: {list(existing_results.columns)}")
     
     # Prepare targets based on benchmark type
@@ -783,6 +816,7 @@ def run_robust_comparison(
     
     # Compare all pairs of embeddings
     all_new_results = []
+    trial_data_dict = {}  # Track individual trial data for Type 1 CSV
     n_types = len(embedding_types)
     
     for i in range(n_types):
@@ -827,7 +861,8 @@ def run_robust_comparison(
                     model2_idx=j,
                     device=device,
                     existing_results=existing_results,
-                    pairs_to_compute=pairs_to_compute
+                    pairs_to_compute=pairs_to_compute,
+                    trial_data_dict=trial_data_dict
                 )
                 all_new_results.append(result_df)
             else:
@@ -842,21 +877,27 @@ def run_robust_comparison(
     # Concatenate all NEW results we just computed
     new_results = pd.concat(all_new_results, ignore_index=True)
     
-    # MERGE with existing results - ONLY ADD, NEVER DELETE
-    if existing_results is not None:
-        # Keep ALL old results + ALL new results
-        final_results = pd.concat([existing_results, new_results], ignore_index=True)
-        print(f"\n  Merged into {len(final_results)} total rows ({len(new_results)} new)")
-    else:
-        final_results = new_results
+    # Add metadata for consistency with cross-corpus comparison format
+    new_results['comparison_type'] = 'same_corpus'
+    new_results['corpus1'] = corpus_path
+    new_results['corpus2'] = corpus_path
+    # embedding1 and embedding2 are already in model1 and model2 columns
     
-    # Save merged results
-    if output_path:
-        print(f"\nSaving results to {output_path}...")
-        final_results.to_csv(output_path, index=False)
-        print("Results saved!")
+    # Split results for Type 1 and Type 2 saving
+    per_embedding_dict, comparison_df = split_results_for_saving(new_results, trial_data_dict)
     
-    return final_results
+    # Save Type 1: Per-embedding results
+    if per_embedding_output_dir:
+        print(f"\nSaving per-embedding results (Type 1)...")
+        for embedding_name, emb_df in per_embedding_dict.items():
+            save_per_embedding_results(emb_df, per_embedding_output_dir, embedding_name)
+    
+    # Save Type 2: Comparison results (always appends)
+    if comparison_output_path:
+        print(f"\nSaving comparison results (Type 2)...")
+        save_comparison_results(comparison_df, comparison_output_path)
+    
+    return new_results
 
 
 if __name__ == '__main__':
@@ -871,7 +912,8 @@ if __name__ == '__main__':
         n_folds=5,
         n_repeats=5,
         benchmark_type='nasbench',
-        output_path='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/robust_comparison_results.csv',
+        comparison_output_path='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/comparisons_global.csv',
+        per_embedding_output_dir='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/per_embedding_results/',
         device='cuda'
     )
     
