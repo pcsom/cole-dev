@@ -10,22 +10,66 @@ import pandas as pd
 import os
 
 
-def save_per_embedding_results(results_df, output_dir, embedding_name):
+def load_existing_trials(output_dir, embedding_name, corpus_name):
+    """
+    Load existing trial data from a Type 1 CSV file.
+    
+    Args:
+        output_dir: Directory containing per-embedding CSV files
+        embedding_name: Name of the embedding
+        corpus_name: Name of the corpus
+    
+    Returns:
+        Dictionary mapping sample_size to list of (trial_num, ktau, mse) tuples
+        Returns empty dict if file doesn't exist
+    """
+    if output_dir is None:
+        return {}
+    
+    csv_path = os.path.join(output_dir, f"{embedding_name}_{corpus_name}.csv")
+    
+    if not os.path.exists(csv_path):
+        return {}
+    
+    try:
+        df = pd.read_csv(csv_path)
+        trials_dict = {}
+        
+        for _, row in df.iterrows():
+            sample_size = int(row['sample_size'])
+            fold = int(row['fold'])
+            repeat = int(row['repeat'])
+            ktau = float(row['kendall_tau'])
+            mse = float(row['mse'])
+            
+            if sample_size not in trials_dict:
+                trials_dict[sample_size] = []
+            
+            trials_dict[sample_size].append((fold, repeat, ktau, mse))
+        
+        return trials_dict
+    except Exception as e:
+        print(f"  Warning: Error loading {csv_path}: {e}")
+        return {}
+
+
+def save_per_embedding_results(results_df, output_dir, embedding_name, corpus_name):
     """
     Save per-embedding results to a CSV file.
-    Type 1: One CSV per embedding containing individual trial results (one row per trial).
+    Type 1: One CSV per embedding+corpus containing individual trial results (one row per trial).
     Always appends to existing CSV (add, don't delete behavior).
     
     Args:
         results_df: DataFrame with per-embedding trial results for ONE embedding
         output_dir: Directory to save CSV files
         embedding_name: Name of the embedding (used in filename)
+        corpus_name: Name of the corpus (used in filename)
     
     Returns:
         Path to the saved CSV file
     """
     os.makedirs(output_dir, exist_ok=True)
-    base_filename = f"embedding_{embedding_name}.csv"
+    base_filename = f"{embedding_name}_{corpus_name}.csv"
     output_path = os.path.join(output_dir, base_filename)
     
     if os.path.exists(output_path):
@@ -85,15 +129,12 @@ def split_results_for_saving(results_df, trial_data_dict):
         'sample_size', 'model1', 'model2', 'metric',
         # Model1 intrinsics (aggregated)
         'model1_mean_ktau', 'model1_std_ktau',
-        'model1_mean_r2', 'model1_std_r2',
         'model1_mean_mse', 'model1_std_mse',
         # Model2 intrinsics (aggregated)
         'model2_mean_ktau', 'model2_std_ktau',
-        'model2_mean_r2', 'model2_std_r2',
         'model2_mean_mse', 'model2_std_mse',
         # Comparison statistics
         'mean_diff_ktau', 'std_diff_ktau', 't_statistic_ktau', 'p_value_ktau', 'significant_ktau',
-        'mean_diff_r2', 'std_diff_r2', 't_statistic_r2', 'p_value_r2', 'significant_r2',
         'mean_diff_mse', 'std_diff_mse', 't_statistic_mse', 'p_value_mse', 'significant_mse',
         'n_trials', 'n_train_actual', 'n_test_actual',
         # Metadata (optional, from cross-corpus comparisons)
@@ -124,13 +165,13 @@ def split_results_for_saving(results_df, trial_data_dict):
     for embedding_name, sample_dict in trial_data_dict.items():
         trials_list = []
         for sample_size, trials in sample_dict.items():
-            for trial_num, ktau, r2, mse in trials:
+            for fold, repeat, ktau, mse in trials:
                 trials_list.append({
                     'embedding_name': embedding_name,
                     'sample_size': sample_size,
-                    'trial_number': trial_num,
+                    'fold': fold,
+                    'repeat': repeat,
                     'kendall_tau': ktau,
-                    'r2': r2,
                     'mse': mse
                 })
         

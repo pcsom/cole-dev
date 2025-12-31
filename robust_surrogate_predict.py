@@ -24,7 +24,7 @@ import scipy.stats as stats
 from scipy.stats import kendalltau
 from typing import List, Dict, Optional, Tuple
 import os
-from results_io import save_per_embedding_results, save_comparison_results, split_results_for_saving
+from results_io import save_per_embedding_results, save_comparison_results, split_results_for_saving, load_existing_trials
 
 
 class MLPSurrogate(nn.Module):
@@ -153,7 +153,7 @@ def train_model_on_subsample(
         # 1. Check for NaNs in output (Gradient explosion)
         if np.any(np.isnan(acc_pred)):
             print(f"  WARNING: NaNs in prediction. Assigning Tau=0.0.")
-            return { 'kendall_tau': 0.0, 'r2': 0.0, 'mse': 999.0, 'n_train': sample_size, 'n_test': len(X_test) }
+            return { 'kendall_tau': 0.0, 'mse': 999.0, 'n_train': sample_size, 'n_test': len(X_test) }
         
         pred_variance = np.var(acc_pred)
         true_variance = np.var(acc_true)
@@ -166,28 +166,22 @@ def train_model_on_subsample(
         
         # Kendall's Tau - PRIMARY METRIC for NAS
         # Measures rank correlation: does the surrogate order architectures correctly?
-        # More robust than R² for low-data regimes and non-linear relationships
+        # More robust than MSE for low-data regimes and non-linear relationships
         try:
             ktau, ktau_pvalue = kendalltau(acc_true, acc_pred)
         except Exception:
             ktau = np.nan # Catch internal scipy errors
         
-        # 43. Handle NaN return from kendalltau (occurs with ties/constants)
+        # 3. Handle NaN return from kendalltau (occurs with ties/constants)
         if np.isnan(ktau):
             print(f"  WARNING: kendalltau returned NaN (likely due to ties). Assigning Tau=0.0.")
             ktau = 0.0      # Penalize the model
         
-        # R2 score (kept for reference)
-        ss_res = np.sum((acc_true - acc_pred) ** 2)
-        ss_tot = np.sum((acc_true - acc_true.mean()) ** 2)
-        r2 = 1 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
-        
-        # MSE (kept for reference)
+        # MSE (mean squared error)
         mse = np.mean((acc_true - acc_pred) ** 2)
     
     return {
         'kendall_tau': ktau,  # Primary metric
-        'r2': r2,
         'mse': mse,
         'n_train': sample_size,
         'n_test': len(X_test)
@@ -250,7 +244,6 @@ def subsampled_repeated_kfold_comparison(
     batch_size=32,
     device='cuda',
     random_state=42,
-    existing_results=None,
     pairs_to_compute=None,
     trial_data_dict=None
 ):
@@ -310,16 +303,10 @@ def subsampled_repeated_kfold_comparison(
     for sample_size in sample_sizes:
         print(f"\n--- Sample Size: {sample_size} ---")
         
-        # Determine how many trials already exist and how many we need
-        existing_trials = 0
-        if existing_results is not None:
-            mask = (
-                (existing_results['model1'] == model1_name) &
-                (existing_results['model2'] == model2_name) &
-                (existing_results['sample_size'] == sample_size)
-            )
-            if mask.any():
-                existing_trials = existing_results[mask]['n_trials'].iloc[0]
+        # Determine how many trials already exist from trial_data_dict (Type 1 CSVs)
+        existing_trials_m1 = len(trial_data_dict.get(model1_name, {}).get(sample_size, []))
+        existing_trials_m2 = len(trial_data_dict.get(model2_name, {}).get(sample_size, []))
+        existing_trials = min(existing_trials_m1, existing_trials_m2)  # Both models must have same trials
         
         total_trials_needed = n_folds * n_repeats
         trials_to_compute = total_trials_needed - existing_trials
@@ -333,13 +320,10 @@ def subsampled_repeated_kfold_comparison(
         differences = []  # Store Model1 - Model2 for ONLY NEW trials
         model1_ktau_scores = []  # Track individual model1 Kendall's Tau scores
         model2_ktau_scores = []  # Track individual model2 Kendall's Tau scores
-        model1_r2_scores = []  # Track individual model1 R² scores
-        model2_r2_scores = []  # Track individual model2 R² scores
         model1_mse_scores = []  # Track individual model1 MSE scores
         model2_mse_scores = []  # Track individual model2 MSE scores
         
         differences_ktau = []  # Store Model1 - Model2 Kendall's Tau differences
-        differences_r2 = []  # Store Model1 - Model2 R² differences
         differences_mse = []  # Store Model1 - Model2 MSE differences
         
         # Start from where we left off
@@ -398,12 +382,7 @@ def subsampled_repeated_kfold_comparison(
                 differences.append(diff_ktau)
                 differences_ktau.append(diff_ktau)
                 
-                # Also store R² and MSE scores and differences
-                model1_r2_scores.append(result1['r2'])
-                model2_r2_scores.append(result2['r2'])
-                diff_r2 = result1['r2'] - result2['r2']
-                differences_r2.append(diff_r2)
-                
+                # Also store MSE scores and differences
                 model1_mse_scores.append(result1['mse'])
                 model2_mse_scores.append(result2['mse'])
                 diff_mse = result1['mse'] - result2['mse']
@@ -423,12 +402,12 @@ def subsampled_repeated_kfold_comparison(
                     if sample_size not in trial_data_dict[model2_name]:
                         trial_data_dict[model2_name][sample_size] = []
                     
-                    # Append trial data: (trial_num, ktau, r2, mse)
+                    # Append trial data: (fold, repeat, ktau, mse)
                     trial_data_dict[model1_name][sample_size].append(
-                        (trial_number, result1['kendall_tau'], result1['r2'], result1['mse'])
+                        (fold_idx, repeat, result1['kendall_tau'], result1['mse'])
                     )
                     trial_data_dict[model2_name][sample_size].append(
-                        (trial_number, result2['kendall_tau'], result2['r2'], result2['mse'])
+                        (fold_idx, repeat, result2['kendall_tau'], result2['mse'])
                     )
                 
                 total_trials += 1
@@ -440,88 +419,64 @@ def subsampled_repeated_kfold_comparison(
         n_train = len(pool_idx)
         n_test = len(test_idx)
         
-        # Get ALL differences (existing + new)
-        all_differences = []
-        if existing_results is not None:
-            mask = (
-                (existing_results['model1'] == model1_name) &
-                (existing_results['model2'] == model2_name) &
-                (existing_results['sample_size'] == sample_size)
-            )
-            if mask.any():
-                # Reconstruct differences from existing stats
-                # We can't recover individual trial differences, but we have aggregate stats
-                # For now, just use new differences for the incremental result row
-                pass
+        # Get ALL trials from trial_data_dict (existing + new)
+        all_model1_trials = trial_data_dict.get(model1_name, {}).get(sample_size, [])
+        all_model2_trials = trial_data_dict.get(model2_name, {}).get(sample_size, [])
         
-        # Combine with existing if present
-        new_differences = np.array(differences)
-        new_differences_ktau = np.array(differences_ktau)
-        new_differences_r2 = np.array(differences_r2)
-        new_differences_mse = np.array(differences_mse)
+        # Extract metrics from all trials: (fold_idx, repeat, ktau, mse)
+        all_model1_ktau = [t[2] for t in all_model1_trials]  # index 2 is ktau
+        all_model1_mse = [t[3] for t in all_model1_trials]   # index 3 is mse
         
-        model1_ktau_array = np.array(model1_ktau_scores)
-        model2_ktau_array = np.array(model2_ktau_scores)
-        model1_r2_array = np.array(model1_r2_scores)
-        model2_r2_array = np.array(model2_r2_scores)
-        model1_mse_array = np.array(model1_mse_scores)
-        model2_mse_array = np.array(model2_mse_scores)
+        all_model2_ktau = [t[2] for t in all_model2_trials]  # index 2 is ktau
+        all_model2_mse = [t[3] for t in all_model2_trials]   # index 3 is mse
+        
+        # Convert to arrays
+        model1_ktau_array = np.array(all_model1_ktau)
+        model2_ktau_array = np.array(all_model2_ktau)
+        model1_mse_array = np.array(all_model1_mse)
+        model2_mse_array = np.array(all_model2_mse)
+        
+        # Calculate differences for all trials
+        all_differences_ktau = model1_ktau_array - model2_ktau_array
+        all_differences_mse = model1_mse_array - model2_mse_array
         
         # Calculate statistics on Kendall's Tau
         model1_mean_ktau = np.mean(model1_ktau_array)
         model1_std_ktau = np.std(model1_ktau_array)
         model2_mean_ktau = np.mean(model2_ktau_array)
         model2_std_ktau = np.std(model2_ktau_array)
-        mean_diff_ktau = np.mean(new_differences_ktau)
-        std_diff_ktau = np.std(new_differences_ktau)
+        mean_diff_ktau = np.mean(all_differences_ktau)
+        std_diff_ktau = np.std(all_differences_ktau)
         
-        # Calculate statistics on R² and MSE
-        model1_mean_r2 = np.mean(model1_r2_array)
-        model1_std_r2 = np.std(model1_r2_array)
-        model2_mean_r2 = np.mean(model2_r2_array)
-        model2_std_r2 = np.std(model2_r2_array)
-        mean_diff_r2 = np.mean(new_differences_r2)
-        std_diff_r2 = np.std(new_differences_r2)
-        
+        # Calculate statistics on MSE
         model1_mean_mse = np.mean(model1_mse_array)
         model1_std_mse = np.std(model1_mse_array)
         model2_mean_mse = np.mean(model2_mse_array)
         model2_std_mse = np.std(model2_mse_array)
-        mean_diff_mse = np.mean(new_differences_mse)
-        std_diff_mse = np.std(new_differences_mse)
+        mean_diff_mse = np.mean(all_differences_mse)
+        std_diff_mse = np.std(all_differences_mse)
         
-        # Perform corrected paired t-test on all three metrics
-        t_stat_ktau, p_value_ktau = corrected_paired_ttest(new_differences_ktau, n_train, n_test)
-        t_stat_r2, p_value_r2 = corrected_paired_ttest(new_differences_r2, n_train, n_test)
-        t_stat_mse, p_value_mse = corrected_paired_ttest(new_differences_mse, n_train, n_test)
+        # Perform corrected paired t-test on both metrics (using ALL trials)
+        t_stat_ktau, p_value_ktau = corrected_paired_ttest(all_differences_ktau, n_train, n_test)
+        t_stat_mse, p_value_mse = corrected_paired_ttest(all_differences_mse, n_train, n_test)
         
         results.append({
             'sample_size': sample_size,
             'model1': model1_name,
             'model2': model2_name,
-            'metric': 'kendall_tau',  # Track which metric
-            'model1_mean': model1_mean_ktau,
-            'model1_std': model1_std_ktau,
-            'model2_mean': model2_mean_ktau,
-            'model2_std': model2_std_ktau,
-            'mean_diff': mean_diff_ktau,
-            'std_diff': std_diff_ktau,
-            't_statistic': t_stat_ktau,
-            'p_value': p_value_ktau,
-            'significant': p_value_ktau < 0.05,
-            'n_trials': len(new_differences),  # Only NEW trials
+            'metric': 'kendall_tau',
+            'model1_mean_ktau': model1_mean_ktau,
+            'model1_std_ktau': model1_std_ktau,
+            'model2_mean_ktau': model2_mean_ktau,
+            'model2_std_ktau': model2_std_ktau,
+            'mean_diff_ktau': mean_diff_ktau,
+            'std_diff_ktau': std_diff_ktau,
+            't_statistic_ktau': t_stat_ktau,
+            'p_value_ktau': p_value_ktau,
+            'significant_ktau': p_value_ktau < 0.05,
+            'n_trials': len(all_model1_trials),  # Total trials (existing + new)
             'n_train_actual': n_train,
             'n_test_actual': n_test,
-            # R² statistics and significance
-            'model1_mean_r2': model1_mean_r2,
-            'model1_std_r2': model1_std_r2,
-            'model2_mean_r2': model2_mean_r2,
-            'model2_std_r2': model2_std_r2,
-            'mean_diff_r2': mean_diff_r2,
-            'std_diff_r2': std_diff_r2,
-            't_statistic_r2': t_stat_r2,
-            'p_value_r2': p_value_r2,
-            'significant_r2': p_value_r2 < 0.05,
             # MSE statistics and significance
             'model1_mean_mse': model1_mean_mse,
             'model1_std_mse': model1_std_mse,
@@ -540,11 +495,9 @@ def subsampled_repeated_kfold_comparison(
         print(f"{'='*70}")
         print(f"  {model1_name}:")
         print(f"    Kendall's Tau = {model1_mean_ktau:.4f} ± {model1_std_ktau:.4f}")
-        print(f"    R² = {model1_mean_r2:.4f} ± {model1_std_r2:.4f}")
         print(f"    MSE = {model1_mean_mse:.4f} ± {model1_std_mse:.4f}")
         print(f"  {model2_name}:")
         print(f"    Kendall's Tau = {model2_mean_ktau:.4f} ± {model2_std_ktau:.4f}")
-        print(f"    R² = {model2_mean_r2:.4f} ± {model2_std_r2:.4f}")
         print(f"    MSE = {model2_mean_mse:.4f} ± {model2_std_mse:.4f}")
         print(f"  Difference (M1-M2): {mean_diff_ktau:.4f} ± {std_diff_ktau:.4f}")
         if model1_mean_ktau < 0 or model2_mean_ktau < 0:
@@ -577,17 +530,6 @@ def subsampled_repeated_kfold_comparison(
         else:
             print(f"  ✗ NOT SIGNIFICANT (p≥0.05): Cannot conclude which is better")
         
-        # R² significance test
-        print(f"\nOne-Tailed Hypothesis Test (R²):")
-        print(f"  Difference (M1-M2): {mean_diff_r2:.4f} ± {std_diff_r2:.4f}")
-        print(f"  t-statistic: {t_stat_r2:.3f}, p-value: {p_value_r2:.4f}")
-        if p_value_r2 < 0.05:
-            better_model_r2 = model1_name if mean_diff_r2 > 0 else model2_name
-            worse_model_r2 = model2_name if mean_diff_r2 > 0 else model1_name
-            print(f"  ✓ SIGNIFICANT (p<0.05): {better_model_r2} is significantly better than {worse_model_r2}")
-        else:
-            print(f"  ✗ NOT SIGNIFICANT (p≥0.05): Cannot conclude which is better")
-        
         # MSE significance test
         print(f"\nOne-Tailed Hypothesis Test (MSE):")
         print(f"  Difference (M1-M2): {mean_diff_mse:.4f} ± {std_diff_mse:.4f}")
@@ -605,12 +547,14 @@ def subsampled_repeated_kfold_comparison(
     return pd.DataFrame(results)
 
 
-def run_cross_corpus_comparison(
+def run_comparison(
+    embedding1_name,
+    corpus1_name,
+    embedding2_name,
+    corpus2_name,
     corpus_path1,
-    corpus_path2,
-    embedding_name1,
-    embedding_name2=None,
-    comparison_label='cross_corpus',
+    corpus_path2=None,
+    comparison_label='comparison',
     sample_sizes=[15, 50, 150, 500, 1500, 5000],
     n_folds=5,
     n_repeats=5,
@@ -621,93 +565,130 @@ def run_cross_corpus_comparison(
     force=False
 ):
     """
-    Compare embeddings from TWO different corpus files.
-    Can compare same embedding (e.g., quantized vs non-quantized) or different embeddings.
+    Compare two embeddings (same corpus or cross-corpus).
+    
+    Workflow:
+      1. Load existing trials from Type 1 CSVs for both embeddings
+      2. Determine which trials are missing and run them
+      3. Save new trials to Type 1 CSVs
+      4. Compute aggregated statistics and save to Type 2 CSV
     
     Args:
-        corpus_path1: Path to first corpus pickle
-        corpus_path2: Path to second corpus pickle
-        embedding_name1: Name of embedding in corpus 1 (e.g., 'codestral_7b_pytorch_code_embedding')
-        embedding_name2: Name of embedding in corpus 2 (if None, uses same as embedding_name1)
-        comparison_label: Label for comparison (e.g., 'quant_vs_noquant', 'model_x_vs_y')
-        sample_sizes: List of training sizes for learning curve
+        embedding1_name: Name of first embedding
+        corpus1_name: Name identifier for corpus 1 (used in filenames)
+        embedding2_name: Name of second embedding
+        corpus2_name: Name identifier for corpus 2 (used in filenames)
+        corpus_path1: Path to corpus for embedding1 (and embedding2 if corpus_path2=None)
+        corpus_path2: Path to corpus for embedding2 (if None, use corpus_path1 for both)
+        comparison_label: Label for comparison (e.g., 'quant_vs_noquant')
+        sample_sizes: List of training sizes
         n_folds: Number of CV folds
         n_repeats: Number of CV repeats
         benchmark_type: 'nasbench' or 'jahs'
-        comparison_output_path: Path to save global comparison CSV (Type 2)
-        per_embedding_output_dir: Directory to save per-embedding CSVs (Type 1)
+        comparison_output_path: Path to global comparison CSV (Type 2)
+        per_embedding_output_dir: Directory for per-embedding CSVs (Type 1)
         device: Device to use
-        force: If True, recompute all comparisons regardless of existing results
+        force: If True, ignore existing trials and recompute all
     
     Returns:
         DataFrame with comparison results
     """
-    # Default to same embedding in both corpora if not specified
-    if embedding_name2 is None:
-        embedding_name2 = embedding_name1
-    
     print(f"\n{'='*80}")
-    print(f"Cross-Corpus Comparison: {comparison_label}")
+    print(f"Comparison: {comparison_label}")
     print(f"{'='*80}")
-    print(f"Corpus 1: {corpus_path1}")
-    print(f"  Embedding: {embedding_name1}")
-    print(f"Corpus 2: {corpus_path2}")
-    print(f"  Embedding: {embedding_name2}")
-    print(f"{'='*80}\n")
     
-    # Load both corpora
-    print(f"Loading corpus 1 from {corpus_path1}...")
-    df1 = pd.read_pickle(corpus_path1)
-    print(f"  Loaded {len(df1)} architectures")
+    # Determine if same corpus or cross-corpus
+    if corpus_path2 is None:
+        corpus_path2 = corpus_path1
+        is_cross_corpus = False
+    else:
+        is_cross_corpus = (corpus_path1 != corpus_path2)
     
-    print(f"Loading corpus 2 from {corpus_path2}...")
-    df2 = pd.read_pickle(corpus_path2)
-    print(f"  Loaded {len(df2)} architectures")
+    # Load corpus/corpora
+    if not is_cross_corpus:
+        # Same corpus comparison
+        print(f"Loading corpus from {corpus_path1}...")
+        df = pd.read_pickle(corpus_path1)
+        print(f"  Loaded {len(df)} architectures")
+        
+        # Verify both embeddings exist
+        if embedding1_name not in df.columns:
+            raise ValueError(f"Embedding '{embedding1_name}' not found in corpus")
+        if embedding2_name not in df.columns:
+            raise ValueError(f"Embedding '{embedding2_name}' not found in corpus")
+        
+        # Extract embeddings
+        X1 = np.array(df[embedding1_name].tolist()).astype(np.float32)
+        X2 = np.array(df[embedding2_name].tolist()).astype(np.float32)
+        
+        model1_name = embedding1_name
+        model2_name = embedding2_name
+        corpus1 = corpus_path1
+        corpus2 = corpus_path1
+        
+    else:
+        # Cross-corpus comparison
+        print(f"Loading corpus 1 from {corpus_path1}...")
+        df1 = pd.read_pickle(corpus_path1)
+        print(f"  Loaded {len(df1)} architectures")
+        
+        print(f"Loading corpus 2 from {corpus_path2}...")
+        df2 = pd.read_pickle(corpus_path2)
+        print(f"  Loaded {len(df2)} architectures")
+        
+        if len(df1) != len(df2):
+            raise ValueError(f"Corpus sizes don't match: {len(df1)} vs {len(df2)}")
+        
+        # Verify embeddings exist
+        if embedding1_name not in df1.columns:
+            raise ValueError(f"Embedding '{embedding1_name}' not found in corpus 1")
+        if embedding2_name not in df2.columns:
+            raise ValueError(f"Embedding '{embedding2_name}' not found in corpus 2")
+        
+        # Extract embeddings
+        X1 = np.array(df1[embedding1_name].tolist()).astype(np.float32)
+        X2 = np.array(df2[embedding2_name].tolist()).astype(np.float32)
+        
+        model1_name = f"{embedding1_name}_corpus1"
+        model2_name = f"{embedding2_name}_corpus2"
+        corpus1 = corpus_path1
+        corpus2 = corpus_path2
+        df = df1  # Use first dataframe for targets
     
-    # Verify same architectures in same order
-    if len(df1) != len(df2):
-        raise ValueError(f"Corpus sizes don't match: {len(df1)} vs {len(df2)}")
-    
-    # Check if both have the embeddings
-    if embedding_name1 not in df1.columns:
-        raise ValueError(f"Embedding '{embedding_name1}' not found in corpus 1")
-    if embedding_name2 not in df2.columns:
-        raise ValueError(f"Embedding '{embedding_name2}' not found in corpus 2")
-    
-    # Check existing comparison results
-    existing_results = None
-    if comparison_output_path and os.path.exists(comparison_output_path) and not force:
-        print(f"\nLoading existing comparison results from {comparison_output_path}...")
-        existing_results = pd.read_csv(comparison_output_path)
-        print(f"  Found {len(existing_results)} existing comparison rows")
-    
-    # Prepare targets (use corpus 1, should be identical in both)
+    # Prepare targets
     if benchmark_type == 'nasbench':
-        y = df1[['cifar10-valid_valid_loss', 'cifar10-valid_valid_accuracy']].values.astype(np.float32)
+        y = df[['cifar10-valid_valid_loss', 'cifar10-valid_valid_accuracy']].values.astype(np.float32)
     elif benchmark_type == 'jahs':
-        y = df1[['test_acc', 'valid_acc']].values.astype(np.float32)
+        y = df[['test_acc', 'valid_acc']].values.astype(np.float32)
     else:
         raise ValueError(f"Unknown benchmark_type: {benchmark_type}")
     
     print(f"Targets shape: {y.shape}, dtype: {y.dtype}")
     
-    # Extract embeddings from both corpora
-    X1 = np.array(df1[embedding_name1].tolist()).astype(np.float32)
-    X2 = np.array(df2[embedding_name2].tolist()).astype(np.float32)
+    print(f"\nComparing: {model1_name} vs {model2_name}")
+    print(f"  {model1_name}: {X1.shape}")
+    print(f"  {model2_name}: {X2.shape}")
+    print(f"{'='*80}\n")
     
-    print(f"\nEmbeddings from corpus 1 ({embedding_name1}): {X1.shape}, dtype {X1.dtype}")
-    print(f"Embeddings from corpus 2 ({embedding_name2}): {X2.shape}, dtype {X2.dtype}")
+    # Load existing trials from Type 1 CSVs
+    trial_data_dict = {}
+    if not force and per_embedding_output_dir:
+        print(f"Loading existing trials from Type 1 CSVs...")
+        trial_data_dict[model1_name] = load_existing_trials(
+            per_embedding_output_dir, embedding1_name, corpus1_name
+        )
+        trial_data_dict[model2_name] = load_existing_trials(
+            per_embedding_output_dir, embedding2_name, corpus2_name
+        )
+        
+        total_m1 = sum(len(trials) for trials in trial_data_dict[model1_name].values())
+        total_m2 = sum(len(trials) for trials in trial_data_dict[model2_name].values())
+        print(f"  {model1_name}: {total_m1} existing trials")
+        print(f"  {model2_name}: {total_m2} existing trials")
     
-    # Create model names
-    model1_name = f"{embedding_name1}_corpus1"
-    model2_name = f"{embedding_name2}_corpus2"
-    
-    # Prepare X dict for comparison function
+    # Prepare X dict
     X = {model1_name: X1, model2_name: X2}
     embedding_types = [model1_name, model2_name]
-    
-    # Initialize trial data tracking for Type 1 CSV
-    trial_data_dict = {}
     
     # Run comparison
     result_df = subsampled_repeated_kfold_comparison(
@@ -718,28 +699,37 @@ def run_cross_corpus_comparison(
         model1_idx=0,
         model2_idx=1,
         device=device,
-        existing_results=existing_results,
         pairs_to_compute=None,
         trial_data_dict=trial_data_dict
     )
     
-    # Add comparison metadata
+    # Add metadata
     result_df['comparison_type'] = comparison_label
-    result_df['embedding1'] = embedding_name1
-    result_df['embedding2'] = embedding_name2
-    result_df['corpus1'] = corpus_path1
-    result_df['corpus2'] = corpus_path2
+    result_df['embedding1'] = embedding1_name
+    result_df['embedding2'] = embedding2_name
+    result_df['corpus1'] = corpus1_name
+    result_df['corpus2'] = corpus2_name
     
-    # Split results for Type 1 and Type 2 saving
+    # Split and save results
     per_embedding_dict, comparison_df = split_results_for_saving(result_df, trial_data_dict)
     
-    # Save Type 1: Per-embedding results
+    # Save Type 1: Per-embedding results (only NEW trials)
     if per_embedding_output_dir:
         print(f"\nSaving per-embedding results (Type 1)...")
         for embedding_name, emb_df in per_embedding_dict.items():
-            save_per_embedding_results(emb_df, per_embedding_output_dir, embedding_name)
+            if len(emb_df) > 0:  # Only save if there are new trials
+                # Determine which corpus this embedding belongs to
+                if embedding_name == model1_name:
+                    corpus_name = corpus1_name
+                    actual_embedding_name = embedding1_name
+                else:
+                    corpus_name = corpus2_name
+                    actual_embedding_name = embedding2_name
+                
+                save_per_embedding_results(emb_df, per_embedding_output_dir, 
+                                          actual_embedding_name, corpus_name)
     
-    # Save Type 2: Comparison results (always appends)
+    # Save Type 2: Comparison results (always save)
     if comparison_output_path:
         print(f"\nSaving comparison results (Type 2)...")
         save_comparison_results(comparison_df, comparison_output_path)
@@ -747,167 +737,15 @@ def run_cross_corpus_comparison(
     return result_df
 
 
-def run_robust_comparison(
-    corpus_path,
-    embedding_types,
-    sample_sizes=[15, 50, 150, 500, 1500, 5000],
-    n_folds=5,
-    n_repeats=5,
-    benchmark_type='nasbench',  # 'nasbench' or 'jahs'
-    comparison_output_path=None,
-    per_embedding_output_dir=None,
-    device='cuda',
-    force=False
-):
-    """
-    Run robust comparison on a corpus with multiple embeddings.
-    Incrementally adds trials - only computes missing comparisons.
-    
-    Args:
-        corpus_path: Path to corpus pickle
-        embedding_types: List of embedding column names to compare
-        sample_sizes: List of training sizes for learning curve
-        n_folds: Number of CV folds
-        n_repeats: Number of CV repeats
-        benchmark_type: 'nasbench' or 'jahs'
-        comparison_output_path: Path to save global comparison CSV (Type 2)
-        per_embedding_output_dir: Directory to save per-embedding CSVs (Type 1)
-        device: Device to use
-        force: If True, recompute all comparisons regardless of existing results
-    
-    Returns:
-        DataFrame with comparison results
-    """
-    print(f"Loading corpus from {corpus_path}...")
-    df = pd.read_pickle(corpus_path)
-    print(f"Loaded {len(df)} architectures")
-    
-    # Check existing comparison results
-    existing_results = None
-    if comparison_output_path and os.path.exists(comparison_output_path) and not force:
-        print(f"\nLoading existing comparison results from {comparison_output_path}...")
-        existing_results = pd.read_csv(comparison_output_path)
-        print(f"  Found {len(existing_results)} existing comparison rows")
-        print(f"  Existing columns: {list(existing_results.columns)}")
-    
-    # Prepare targets based on benchmark type
-    if benchmark_type == 'nasbench':
-        # Use CIFAR-10 metrics
-        y = df[['cifar10-valid_valid_loss', 'cifar10-valid_valid_accuracy']].values.astype(np.float32)
-    elif benchmark_type == 'jahs':
-        # Use test and validation accuracy (JAHS doesn't have loss metrics)
-        y = df[['test_acc', 'valid_acc']].values.astype(np.float32)
-    else:
-        raise ValueError(f"Unknown benchmark_type: {benchmark_type}")
-
-    print(f"Targets shape: {y.shape}, dtype: {y.dtype}")
-
-    # Preview two rows
-    print("\nSample target values:")
-    print(y[:2])
-    
-    # Prepare features (embeddings)
-    X = {}
-    for emb_type in embedding_types:
-        if emb_type not in df.columns:
-            raise ValueError(f"Embedding '{emb_type}' not found in corpus")
-        X[emb_type] = np.array(df[emb_type].tolist()).astype(np.float32)
-        print(f"  {emb_type}: shape {X[emb_type].shape}, dtype {X[emb_type].dtype}")
-    
-    # Compare all pairs of embeddings
-    all_new_results = []
-    trial_data_dict = {}  # Track individual trial data for Type 1 CSV
-    n_types = len(embedding_types)
-    
-    for i in range(n_types):
-        for j in range(i + 1, n_types):
-            model1_name = embedding_types[i]
-            model2_name = embedding_types[j]
-            
-            # Check what we need to compute for this pair
-            pairs_to_compute = []  # List of (sample_size, existing_trials, needed_trials)
-            
-            for sample_size in sample_sizes:
-                expected_trials = n_folds * n_repeats
-                existing_trials = 0
-                
-                if existing_results is not None:
-                    # Check if this model pair + sample size exists
-                    mask = (
-                        (existing_results['model1'] == model1_name) &
-                        (existing_results['model2'] == model2_name) &
-                        (existing_results['sample_size'] == sample_size)
-                    )
-                    if mask.any():
-                        existing_trials = existing_results[mask]['n_trials'].iloc[0]
-                
-                if existing_trials < expected_trials:
-                    needed_trials = expected_trials - existing_trials
-                    pairs_to_compute.append((sample_size, existing_trials, needed_trials))
-                    print(f"  {model1_name} vs {model2_name}, size={sample_size}: "
-                          f"have {existing_trials}/{expected_trials} trials, computing {needed_trials} more")
-                else:
-                    print(f"  {model1_name} vs {model2_name}, size={sample_size}: "
-                          f"already have {existing_trials}/{expected_trials} trials, SKIPPING")
-            
-            if pairs_to_compute:
-                # Compute only the missing trials for this pair
-                result_df = subsampled_repeated_kfold_comparison(
-                    X, y, embedding_types,
-                    sample_sizes=[p[0] for p in pairs_to_compute],  # Only sizes we need
-                    n_folds=n_folds,
-                    n_repeats=n_repeats,
-                    model1_idx=i,
-                    model2_idx=j,
-                    device=device,
-                    existing_results=existing_results,
-                    pairs_to_compute=pairs_to_compute,
-                    trial_data_dict=trial_data_dict
-                )
-                all_new_results.append(result_df)
-            else:
-                print(f"  {model1_name} vs {model2_name}: All trials complete, nothing to compute")
-    
-    if not all_new_results:
-        print("\n" + "="*80)
-        print("No new results to compute - all requested comparisons already exist!")
-        print("="*80)
-        return existing_results if existing_results is not None else pd.DataFrame()
-    
-    # Concatenate all NEW results we just computed
-    new_results = pd.concat(all_new_results, ignore_index=True)
-    
-    # Add metadata for consistency with cross-corpus comparison format
-    new_results['comparison_type'] = 'same_corpus'
-    new_results['corpus1'] = corpus_path
-    new_results['corpus2'] = corpus_path
-    # embedding1 and embedding2 are already in model1 and model2 columns
-    
-    # Split results for Type 1 and Type 2 saving
-    per_embedding_dict, comparison_df = split_results_for_saving(new_results, trial_data_dict)
-    
-    # Save Type 1: Per-embedding results
-    if per_embedding_output_dir:
-        print(f"\nSaving per-embedding results (Type 1)...")
-        for embedding_name, emb_df in per_embedding_dict.items():
-            save_per_embedding_results(emb_df, per_embedding_output_dir, embedding_name)
-    
-    # Save Type 2: Comparison results (always appends)
-    if comparison_output_path:
-        print(f"\nSaving comparison results (Type 2)...")
-        save_comparison_results(comparison_df, comparison_output_path)
-    
-    return new_results
-
 
 if __name__ == '__main__':
-    # Example usage
-    results = run_robust_comparison(
-        corpus_path='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus_embedded_half.pkl',
-        embedding_types=[
-            'deepseek_coder_pytorch_code_embedding',
-            'codellama_python_pytorch_code_embedding'
-        ],
+    # Example usage with simplified run_comparison
+    results = run_comparison(
+        embedding1_name='deepseek_coder_pytorch_code_embedding',
+        embedding2_name='codellama_python_pytorch_code_embedding',
+        corpus_path1='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus_embedded_half.pkl',
+        corpus_path2=None,  # Same corpus
+        comparison_label='deepseek_vs_codellama',
         sample_sizes=[15, 50, 150, 500, 1500],
         n_folds=5,
         n_repeats=5,
@@ -921,3 +759,4 @@ if __name__ == '__main__':
     print("Final Results Summary")
     print("="*80)
     print(results)
+
