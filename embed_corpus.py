@@ -9,7 +9,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
 from generate_corpus import load_corpus
 from embedding_config import MODEL_CONFIGS, get_model_config, FORCE_RECOMPUTE_EMBEDDINGS
-from stringify_utils import generate_dependency_classes, generate_network_class, generate_context_docstring
+from stringify_utils import generate_dependency_classes, generate_network_class, generate_context_docstring, generate_helper_class
 
 # Try to import sentence-transformers (optional)
 try:
@@ -242,9 +242,15 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         force = FORCE_RECOMPUTE_EMBEDDINGS
     
     # Determine code types and expected columns
-    code_types = ['pytorch_code', 'onnx_code', 'grammar_code']
     if pytorch_only:
-        code_types = ['pytorch_code']
+        # Find all columns in dataframe that contain 'pytorch' in their name
+        code_types = [col for col in df.columns if 'pytorch' in col.lower() and not col.endswith('_embedding')]
+        if not code_types:
+            print("WARNING: pytorch_only=True but no pytorch columns found in dataframe")
+            code_types = ['pytorch_code']  # fallback
+        print(f"Processing pytorch columns: {code_types}")
+    else:
+        code_types = ['pytorch_code', 'onnx_code', 'grammar_code']
     
     # Build expected column names based on context mode
     expected_cols = []
@@ -257,10 +263,11 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
             suffix_parts.append('noquant')
         suffix = '_' + '_'.join(suffix_parts) if suffix_parts else ''
         
-        if ct == 'pytorch_code' and pytorch_context_mode == 'network':
-            col_name = f'{model_display_name}_pytorch_code_with_network{suffix}_embedding'
-        elif ct == 'pytorch_code' and pytorch_context_mode == 'comment':
-            col_name = f'{model_display_name}_pytorch_code_with_comment{suffix}_embedding'
+        # Apply context mode naming for any pytorch column
+        if 'pytorch' in ct.lower() and pytorch_context_mode == 'network':
+            col_name = f'{model_display_name}_{ct}_with_network{suffix}_embedding'
+        elif 'pytorch' in ct.lower() and pytorch_context_mode == 'comment':
+            col_name = f'{model_display_name}_{ct}_with_comment{suffix}_embedding'
         else:
             col_name = f'{model_display_name}_{ct}{suffix}_embedding'
         expected_cols.append(col_name)
@@ -354,8 +361,8 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         
         texts = df[code_type].tolist()
         
-        # Apply context mode for pytorch_code
-        if code_type == 'pytorch_code' and pytorch_context_mode is not None:
+        # Apply context mode for any pytorch column (not just 'pytorch_code')
+        if 'pytorch' in code_type.lower() and pytorch_context_mode is not None:
             print(f"Applying pytorch_context_mode='{pytorch_context_mode}'...")
             modified_texts = []
             for text in texts:
@@ -612,9 +619,14 @@ def add_embeddings_to_corpus(
         df_output = df_source.copy()
     
     # Build expected embedding column names based on context mode
-    code_types = ['pytorch_code', 'onnx_code', 'grammar_code']
-    if pytorch_only:
-        code_types = ['pytorch_code']
+    # Find all columns in dataframe that contain 'pytorch' in their name
+    code_types = [col for col in df_source.columns if 'pytorch' in col.lower() and not col.endswith('_embedding')]
+    if not code_types:
+        print("WARNING: pytorch_only=True but no pytorch columns found in dataframe")
+        code_types = ['pytorch_code']  # fallback
+    print(f"Processing pytorch columns: {code_types}")
+    if not pytorch_only:
+        code_types.extend(['onnx_code', 'grammar_code'])
     
     expected_embedding_cols = []
     for ct in code_types:
@@ -626,10 +638,11 @@ def add_embeddings_to_corpus(
             suffix_parts.append('noquant')
         suffix = '_' + '_'.join(suffix_parts) if suffix_parts else ''
         
-        if ct == 'pytorch_code' and pytorch_context_mode == 'network':
-            col_name = f'{model_name}_pytorch_code_with_network{suffix}_embedding'
-        elif ct == 'pytorch_code' and pytorch_context_mode == 'comment':
-            col_name = f'{model_name}_pytorch_code_with_comment{suffix}_embedding'
+        # Apply context mode naming for any pytorch column
+        if 'pytorch' in ct.lower() and pytorch_context_mode == 'network':
+            col_name = f'{model_name}_{ct}_with_network{suffix}_embedding'
+        elif 'pytorch' in ct.lower() and pytorch_context_mode == 'comment':
+            col_name = f'{model_name}_{ct}_with_comment{suffix}_embedding'
         else:
             col_name = f'{model_name}_{ct}{suffix}_embedding'
         expected_embedding_cols.append(col_name)
