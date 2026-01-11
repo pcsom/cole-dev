@@ -6,4 +6,4 @@
 	url = https://github.com/pcsom/ONNX-Net-coder-nas.git
 [submodule "flan_nas"]
 	path = flan_nas
-	url = https://github.com/abdelfattah-lab/flan_nas.git
+	url = https://github.com/pcsom/flan_nas-coder-nas.git
