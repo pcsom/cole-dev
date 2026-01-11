@@ -9,6 +9,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
 from generate_corpus import load_corpus
 from embedding_config import MODEL_CONFIGS, get_model_config, FORCE_RECOMPUTE_EMBEDDINGS
+from stringify_utils import generate_dependency_classes, generate_network_class, generate_context_docstring
 
 # Try to import sentence-transformers (optional)
 try:
@@ -65,6 +66,11 @@ def get_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=20
                 max_length=max_length,
                 return_tensors='pt'
             )
+
+            tokenized_lengths = encoded['attention_mask'].sum(dim=1)
+            # if any length exceeds max_length, print a warning
+            if (tokenized_lengths > max_length).any():
+                print(f"WARNING: Some sequences in batch exceed max_length={max_length} after tokenization.")
             
             # Move to device
             input_ids = encoded['input_ids'].to(device)
@@ -210,7 +216,8 @@ def get_embeddings_sentence_transformers(texts, model, batch_size=16):
     return embeddings
 
 def embed_with_model(df, model_name, model_display_name, device='cuda', force=None, pytorch_only=False, 
-                     use_sentence_transformers=False, use_quantization=True, use_echo_embeddings=False):
+                     use_sentence_transformers=False, use_quantization=True, use_echo_embeddings=False,
+                     pytorch_context_mode=None, max_length=2048):
     """
     Add embeddings from a specific model to the dataframe.
     
@@ -225,6 +232,8 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         use_sentence_transformers: If True, use sentence-transformers library instead of transformers
         use_quantization: If True, use 8-bit quantization for transformers models
         use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
+        pytorch_context_mode: None (default), "network" (add full Network code), or "comment" (add docstring).
+                             Affects pytorch_code embedding by appending context information.
     
     Returns:
         DataFrame with added embedding columns
@@ -232,9 +241,31 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
     if force is None:
         force = FORCE_RECOMPUTE_EMBEDDINGS
     
-    # Check if embeddings already exist
+    # Determine code types and expected columns
     code_types = ['pytorch_code', 'onnx_code', 'grammar_code']
-    expected_cols = [f'{model_display_name}_{ct}_embedding' for ct in code_types]
+    if pytorch_only:
+        code_types = ['pytorch_code']
+    
+    # Build expected column names based on context mode
+    expected_cols = []
+    for ct in code_types:
+        # Build suffix based on echo and quantization settings
+        suffix_parts = []
+        if use_echo_embeddings:
+            suffix_parts.append('echo')
+        if not use_quantization:
+            suffix_parts.append('noquant')
+        suffix = '_' + '_'.join(suffix_parts) if suffix_parts else ''
+        
+        if ct == 'pytorch_code' and pytorch_context_mode == 'network':
+            col_name = f'{model_display_name}_pytorch_code_with_network{suffix}_embedding'
+        elif ct == 'pytorch_code' and pytorch_context_mode == 'comment':
+            col_name = f'{model_display_name}_pytorch_code_with_comment{suffix}_embedding'
+        else:
+            col_name = f'{model_display_name}_{ct}{suffix}_embedding'
+        expected_cols.append(col_name)
+    
+    # Check if embeddings already exist
     existing_cols = [col for col in expected_cols if col in df.columns]
     
     if existing_cols and not force:
@@ -285,6 +316,10 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
             quantization_config = BitsAndBytesConfig(
                 load_in_8bit=True,
                 llm_int8_threshold=6.0
+                # load_in_4bit=True,
+                # bnb_4bit_quant_type="nf4",
+                # bnb_4bit_use_double_quant=True,
+                # bnb_4bit_compute_dtype=torch.bfloat16
             )
             
             model = AutoModel.from_pretrained(
@@ -309,12 +344,35 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         print(f"Model hidden size: {model.config.hidden_size}")
     
     # Process each representation type
-    code_types = ['pytorch_code', 'onnx_code', 'grammar_code']
-    if pytorch_only:
-        code_types = ['pytorch_code']
-    for code_type in code_types:
+    for i, code_type in enumerate(code_types):
         print(f"\nProcessing {code_type}...")
+        
+        # Check if column exists in dataframe
+        if code_type not in df.columns:
+            print(f"WARNING: Column '{code_type}' not found in dataframe. Skipping.")
+            continue
+        
         texts = df[code_type].tolist()
+        
+        # Apply context mode for pytorch_code
+        if code_type == 'pytorch_code' and pytorch_context_mode is not None:
+            print(f"Applying pytorch_context_mode='{pytorch_context_mode}'...")
+            modified_texts = []
+            for text in texts:
+                if pytorch_context_mode == 'network':
+                    # Append full network code
+                    dependency_code = generate_dependency_classes()
+                    network_code = generate_network_class()
+                    modified_text = f"{dependency_code}\n\n{text}\n\n{network_code}"
+                elif pytorch_context_mode == 'comment':
+                    # Prepend docstring description
+                    docstring = generate_context_docstring()
+                    modified_text = f"{docstring}\n\n{text}"
+                else:
+                    modified_text = text
+                modified_texts.append(modified_text)
+            texts = modified_texts
+            print(f"Modified {len(texts)} texts with context")
         
         # Get embeddings using appropriate method
         if use_sentence_transformers:
@@ -322,11 +380,10 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         elif use_echo_embeddings:
             embeddings = get_echo_embeddings(texts, model, tokenizer, device)
         else:
-            embeddings = get_embeddings(texts, model, tokenizer, device)
+            embeddings = get_embeddings(texts, model, tokenizer, device, max_length=max_length)
         
         # Add to dataframe as a column (store as list for each row)
-        suffix = '_echo' if use_echo_embeddings else ''
-        column_name = f'{model_display_name}_{code_type}_embedding{suffix}'
+        column_name = expected_cols[i]
         df[column_name] = embeddings.tolist()
         
         print(f"Added column: {column_name}")
@@ -395,7 +452,8 @@ def embed_corpus(
     use_half=True,
     model_names=None,
     use_echo_embeddings=False,
-    use_quantization=True
+    use_quantization=True,
+    max_length=2048
 ):
     """
     Embed code representations in the corpus using multiple LLMs.
@@ -455,7 +513,8 @@ def embed_corpus(
             device=device,
             use_sentence_transformers=model_config.get('sentence_transformer', False),
             use_quantization=use_quantization,
-            use_echo_embeddings=use_echo_embeddings
+            use_echo_embeddings=use_echo_embeddings,
+            max_length=max_length
         )
     
     # Save results
@@ -493,7 +552,9 @@ def add_embeddings_to_corpus(
     force=None,
     pytorch_only=False,
     use_echo_embeddings=False,
-    use_quantization=True
+    use_quantization=True,
+    pytorch_context_mode=None,
+    max_length=2048
 ):
     """
     Add embeddings from a new model to an existing corpus.
@@ -514,6 +575,8 @@ def add_embeddings_to_corpus(
         pytorch_only: If True, only embed pytorch_code
         use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
         use_quantization: If True, use 8-bit quantization for transformer models (ignored for sentence-transformers)
+        pytorch_context_mode: None (default), "network" (add full Network code), or "comment" (add docstring).
+                             Affects pytorch_code embedding by appending context information.
     
     Returns:
         DataFrame with added embeddings
@@ -548,16 +611,40 @@ def add_embeddings_to_corpus(
         print(f"Output corpus doesn't exist or same as source, will create new")
         df_output = df_source.copy()
     
-    # Check if embeddings already exist in OUTPUT corpus
-    embedding_cols = [col for col in df_output.columns if f'{model_name}_' in col and 'embedding' in col]
-    if embedding_cols and not force:
-        print(f"\nINFO: Embeddings for {model_name} already exist in output: {embedding_cols}")
+    # Build expected embedding column names based on context mode
+    code_types = ['pytorch_code', 'onnx_code', 'grammar_code']
+    if pytorch_only:
+        code_types = ['pytorch_code']
+    
+    expected_embedding_cols = []
+    for ct in code_types:
+        # Build suffix based on echo and quantization settings
+        suffix_parts = []
+        if use_echo_embeddings:
+            suffix_parts.append('echo')
+        if not use_quantization:
+            suffix_parts.append('noquant')
+        suffix = '_' + '_'.join(suffix_parts) if suffix_parts else ''
+        
+        if ct == 'pytorch_code' and pytorch_context_mode == 'network':
+            col_name = f'{model_name}_pytorch_code_with_network{suffix}_embedding'
+        elif ct == 'pytorch_code' and pytorch_context_mode == 'comment':
+            col_name = f'{model_name}_pytorch_code_with_comment{suffix}_embedding'
+        else:
+            col_name = f'{model_name}_{ct}{suffix}_embedding'
+        expected_embedding_cols.append(col_name)
+    
+    # Check if the SPECIFIC embeddings we want to create already exist in OUTPUT corpus
+    existing_expected_cols = [col for col in expected_embedding_cols if col in df_output.columns]
+    
+    if existing_expected_cols and not force:
+        print(f"\nINFO: Embeddings already exist in output: {existing_expected_cols}")
         print(f"Skipping embedding computation (set force=True or FORCE_RECOMPUTE_EMBEDDINGS=True to override)")
         return df_output
     
-    if embedding_cols and force:
-        print(f"\nWARNING: Overwriting existing embeddings for {model_name}: {embedding_cols}")
-        df_output = df_output.drop(columns=embedding_cols)
+    if existing_expected_cols and force:
+        print(f"\nWARNING: Overwriting existing embeddings: {existing_expected_cols}")
+        df_output = df_output.drop(columns=existing_expected_cols)
         print(f"Dropped existing embedding columns from output")
     
     # Get model config
@@ -582,12 +669,19 @@ def add_embeddings_to_corpus(
         use_sentence_transformers=model_config.get('sentence_transformer', False),
         use_quantization=use_quantization,
         pytorch_only=pytorch_only,
-        use_echo_embeddings=use_echo_embeddings
+        use_echo_embeddings=use_echo_embeddings,
+        pytorch_context_mode=pytorch_context_mode,
+        max_length=max_length
     )
     
-    # Extract only the NEW embedding columns
-    new_embedding_cols = [col for col in df_with_new_embeddings.columns 
-                         if f'{model_name}_' in col and 'embedding' in col]
+    # The new columns should match the expected_embedding_cols we computed earlier
+    # Verify they exist in the returned dataframe
+    new_embedding_cols = [col for col in expected_embedding_cols if col in df_with_new_embeddings.columns]
+    
+    if not new_embedding_cols:
+        print("\nWARNING: No new embedding columns found in returned dataframe!")
+        print(f"Expected: {expected_embedding_cols}")
+        print(f"Available: {[c for c in df_with_new_embeddings.columns if 'embedding' in c]}")
     
     print(f"\nNew embedding columns to add: {new_embedding_cols}")
     
