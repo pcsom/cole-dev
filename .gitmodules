@@ -3,7 +3,7 @@
 	url = https://github.com/pcsom/NASlib-coder-nas.git
 [submodule "ONNX-Net"]
 	path = ONNX-Net
-	url = https://github.com/shiwenqin/ONNX-Net.git
+	url = https://github.com/pcsom/ONNX-Net-coder-nas.git
 [submodule "flan_nas"]
 	path = flan_nas
 	url = https://github.com/abdelfattah-lab/flan_nas.git
