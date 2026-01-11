@@ -91,14 +91,206 @@ def parse_nb201_string(arch_str):
     
     return edges
 
-def to_pytorch_code(edges):
-    """Format A: The Class Definition (Your Novelty)"""
-    lines = ["class Cell(nn.Module):", "    def __init__(self):", "        super().__init__()"]
+def generate_dependency_classes():
+    """Generate ReLUConvBN and ResNetBasicblock classes needed by Network."""
+    return """class ReLUConvBN(nn.Module):
+    def __init__(self, C_in, C_out, kernel_size, stride, padding, dilation, affine=True, track_running_stats=True):
+        super(ReLUConvBN, self).__init__()
+        self.op = nn.Sequential(
+            nn.ReLU(inplace=False),
+            nn.Conv2d(C_in, C_out, kernel_size, stride=stride, padding=padding, dilation=dilation, bias=not affine),
+            nn.BatchNorm2d(C_out, affine=affine, track_running_stats=track_running_stats)
+        )
+
+    def forward(self, x):
+        return self.op(x)
+
+class ResNetBasicblock(nn.Module):
+    def __init__(self, inplanes, planes, stride, affine=True, track_running_stats=True):
+        super(ResNetBasicblock, self).__init__()
+        assert stride == 1 or stride == 2
+        self.conv_a = ReLUConvBN(
+            inplanes, planes, 3, stride, 1, 1, affine, track_running_stats
+        )
+        self.conv_b = ReLUConvBN(
+            planes, planes, 3, 1, 1, 1, affine, track_running_stats
+        )
+        if stride == 2:
+            self.downsample = nn.Sequential(
+                nn.AvgPool2d(kernel_size=2, stride=2, padding=0),
+                nn.Conv2d(
+                    inplanes, planes, kernel_size=1, stride=1, padding=0, bias=False
+                ),
+            )
+        elif inplanes != planes:
+            self.downsample = ReLUConvBN(
+                inplanes, planes, 1, 1, 0, 1, affine, track_running_stats
+            )
+        else:
+            self.downsample = None
+        self.in_dim = inplanes
+        self.out_dim = planes
+        self.stride = stride
+        self.num_conv = 2
+
+    def forward(self, inputs):
+        basicblock = self.conv_a(inputs)
+        basicblock = self.conv_b(basicblock)
+        if self.downsample is not None:
+            residual = self.downsample(inputs)
+        else:
+            residual = inputs
+        return residual + basicblock"""
+
+def generate_network_class():
+    """Generate the Network class that wraps Cell for full NASBench-201 architecture."""
+    return """class Network(nn.Module):
+    def __init__(self, C, N, genotype, num_classes):
+        super(Network, self).__init__()
+        self._C = C
+        self._layerN = N
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, C, kernel_size=3, padding=1, bias=False), nn.BatchNorm2d(C)
+        )
+
+        layer_channels = [C] * N + [C * 2] + [C * 2] * N + [C * 4] + [C * 4] * N
+        layer_reductions = [False] * N + [True] + [False] * N + [True] + [False] * N
+
+        C_prev = C
+        self.cells = nn.ModuleList()
+        for index, (C_curr, reduction) in enumerate(
+            zip(layer_channels, layer_reductions)
+        ):
+            if reduction:
+                cell = ResNetBasicblock(C_prev, C_curr, 2, True)
+            else:
+                cell = Cell(C_prev, C_out=C_curr, stride=1)
+            self.cells.append(cell)
+            C_prev = cell.out_dim
+        self._Layer = len(self.cells)
+
+        self.lastact = nn.Sequential(nn.BatchNorm2d(C_prev), nn.ReLU(inplace=True))
+        self.global_pooling = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Linear(C_prev, num_classes)
+
+    def get_training_config(self):
+        optimizer = torch.optim.SGD(
+            self.parameters(),
+            lr=0.1,
+            momentum=0.9,
+            weight_decay=5e-4,
+            nesterov=True
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=200,
+            eta_min=0
+        )
+        config = {
+            'optimizer': optimizer,
+            'scheduler': scheduler,
+            'batch_size': 256,
+            'epochs': 200
+        }
+        return config
+
+    def forward(self, inputs):
+        feature = self.stem(inputs)
+        for i, cell in enumerate(self.cells):
+            feature = cell(feature)
+
+        out = self.lastact(feature)
+        out = self.global_pooling(out)
+        out = out.view(out.size(0), -1)
+        logits = self.classifier(out)
+
+        return out, logits"""
+
+def generate_context_docstring():
+    """Generate a docstring describing the broader network context."""
+    return '''"""
+Task: CIFAR-10 image classification (10 classes, 32x32 RGB images).
+
+This Cell is one building block within a larger neural network.
+Full architecture:
+- Stem layer: Conv2d(3 channels -> 16 channels, 3x3 kernel) + BatchNorm2d.
+- Main head: stacks 15 copies of the Cell into a sequence. 1 ResNetBasicblock layer is inserted every 5 Cells (total 2).
+- Final layers: BatchNorm2d + ReLU + Global Average Pooling + Linear layer to 10 classes.
+
+Helpers:
+- ReLUConvBN: Sequential ReLU -> Convolution -> BatchNormalization
+- ResNetBasicblock: Residual block with 2 ReLUConvBN plus 1 skip connection with input downsampling
+
+Training Details: SGD optimizer with momentum=0.9, weight_decay=5e-4, initial learning_rate=0.1 
+with cosine annealing schedule over 200 epochs, batch_size=256, plus standard data augmentation.
+"""'''
+
+def generate_helper_class():
+    """
+    Generate the Conv2d_BatchNorm_ReLU helper class definition.
+    This helper wraps the common Conv->BN->ReLU pattern used in NASBench-201.
+    
+    Returns:
+        String containing the helper class definition
+    """
+    helper_code = [
+        "class Conv2d_BatchNorm_ReLU(nn.Module):",
+        "    def __init__(self, C_in, C_out, kernel_size, stride, padding):",
+        "        super().__init__()",
+        "        self.op = nn.Sequential(",
+        "            nn.Conv2d(C_in, C_out, kernel_size, stride=stride, padding=padding, bias=False),",
+        "            nn.BatchNorm2d(C_out),",
+        "            nn.ReLU(inplace=False)",
+        "        )",
+        "    ",
+        "    def forward(self, x):",
+        "        return self.op(x)"
+    ]
+    return "\n".join(helper_code)
+
+def to_pytorch_code(edges, context_mode=None, primitives_mode='inline'):
+    """Format A: The Class Definition (Your Novelty)
+    
+    Args:
+        edges: List of (src, dst, op) tuples representing the cell architecture
+        context_mode: None (cell only), "network" (full code), or "comment" (docstring description)
+        primitives_mode: 'inline' (default, use nn.Sequential), 'helper' (use Conv2d_BatchNorm_ReLU helper),
+                        or 'exclude_helper' (reference helper but don't define it)
+    
+    Returns:
+        String containing PyTorch code for Cell (and optionally Network or context docstring)
+    """
+    
+    # Helper function to get op string based on primitives_mode
+    def get_op_string(op):
+        if op == 'skip_connect':
+            return None  # Identity - don't create an op, just pass through
+        elif op == 'avg_pool_3x3':
+            return 'nn.AvgPool2d(kernel_size=3, stride=1, padding=1)'
+        elif op == 'nor_conv_1x1':
+            if primitives_mode == 'inline':
+                return 'nn.Sequential(nn.Conv2d(16, 16, kernel_size=1, stride=1, padding=0, bias=False), nn.BatchNorm2d(16), nn.ReLU())'
+            else:  # helper or exclude_helper
+                return 'Conv2d_BatchNorm_ReLU(C_in=16, C_out=16, kernel_size=1, stride=1, padding=0)'
+        elif op == 'nor_conv_3x3':
+            if primitives_mode == 'inline':
+                return 'nn.Sequential(nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1, bias=False), nn.BatchNorm2d(16), nn.ReLU())'
+            else:  # helper or exclude_helper
+                return 'Conv2d_BatchNorm_ReLU(C_in=16, C_out=16, kernel_size=3, stride=1, padding=1)'
+        else:  # none or unknown
+            return None
+    lines = ["class Cell(nn.Module):", "    def __init__(self, C_in, C_out, stride):", "        super().__init__()"]
+    lines.append("        self.in_dim = C_in")
+    lines.append("        self.out_dim = C_out")
+    lines.append("        self.stride = stride")
     
     # Init Ops
     for i, (src, dst, op) in enumerate(edges):
         if op == 'none': continue
-        lines.append(f"        self.op_{src}_{dst} = nn.{OP_MAP[op]}")
+        op_str = get_op_string(op)
+        if op_str:
+            lines.append(f"        self.op_{src}_{dst} = {op_str}")
     
     lines.append("")
     lines.append("    def forward(self, x):")
@@ -122,7 +314,24 @@ def to_pytorch_code(edges):
             lines.append(f"        node_{target} = {sum_str}")
             
     lines.append("        return node_3")
-    return "\n".join(lines)
+    
+    cell_code = "\n".join(lines)
+    
+    # Prepend helper class if primitives_mode is 'helper'
+    if primitives_mode == 'helper':
+        helper_code = generate_helper_class()
+        cell_code = f"{helper_code}\n\n{cell_code}"
+    
+    # Apply context mode wrapping
+    if context_mode == "network":
+        dependency_code = generate_dependency_classes()
+        network_code = generate_network_class()
+        return f"{dependency_code}\n\n{cell_code}\n\n{network_code}"
+    elif context_mode == "comment":
+        docstring = generate_context_docstring()
+        return f"{docstring}\n\n{cell_code}"
+    else:
+        return cell_code
 
 def to_onnx_net(edges):
     """Format B: ONNX-Net Linearized String"""
@@ -173,19 +382,21 @@ def to_transferable_grammar(edges):
 
 # --- HIGH-LEVEL API FUNCTIONS ---
 
-def arch_to_pytorch_code(arch_index_or_str):
+def arch_to_pytorch_code(arch_index_or_str, context_mode=None, primitives_mode='inline'):
     """
     Convert a NASBench-201 architecture to PyTorch code string.
     
     Args:
         arch_index_or_str: Either an architecture index (int) or architecture string.
+        context_mode: None (cell only), "network" (full code), or "comment" (docstring description).
+        primitives_mode: 'inline' (default), 'helper' (define and use helper), or 'exclude_helper' (use but don't define).
     
     Returns:
-        String containing the PyTorch class definition.
+        String containing the PyTorch class definition(s).
     """
     arch_str = get_architecture_string(arch_index_or_str)
     edges = parse_nb201_string(arch_str)
-    return to_pytorch_code(edges)
+    return to_pytorch_code(edges, context_mode=context_mode, primitives_mode=primitives_mode)
 
 def arch_to_onnx_net(arch_index_or_str):
     """
@@ -215,12 +426,14 @@ def arch_to_grammar(arch_index_or_str):
     edges = parse_nb201_string(arch_str)
     return to_transferable_grammar(edges)
 
-def arch_to_all_formats(arch_index_or_str):
+def arch_to_all_formats(arch_index_or_str, context_mode=None, primitives_mode='inline'):
     """
     Convert a NASBench-201 architecture to all three formats.
     
     Args:
         arch_index_or_str: Either an architecture index (int) or architecture string.
+        context_mode: None (cell only), "network" (full code), or "comment" (docstring) for PyTorch format.
+        primitives_mode: 'inline' (default), 'helper' (define and use helper), or 'exclude_helper' (use but don't define).
     
     Returns:
         Dictionary with keys 'pytorch', 'onnx', 'grammar' containing the three formats.
@@ -229,7 +442,7 @@ def arch_to_all_formats(arch_index_or_str):
     edges = parse_nb201_string(arch_str)
     
     return {
-        'pytorch': to_pytorch_code(edges),
+        'pytorch': to_pytorch_code(edges, context_mode=context_mode, primitives_mode=primitives_mode),
         'onnx': to_onnx_net(edges),
         'grammar': to_transferable_grammar(edges)
     }
