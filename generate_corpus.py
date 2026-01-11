@@ -3,7 +3,7 @@ import pickle
 import json
 import pandas as pd
 from tqdm import tqdm
-from stringify_utils import arch_to_all_formats, get_api, get_architecture_string
+from stringify_utils import arch_to_all_formats, arch_to_pytorch_code, get_api, get_architecture_string
 
 def get_arch_properties(arch_index, dataset='cifar10-valid'):
     """
@@ -118,6 +118,83 @@ def load_corpus(corpus_path='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas
         return pd.read_csv(corpus_path)
     else:
         raise ValueError("Corpus path must be .pkl or .csv file")
+
+def generate_pytorch_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus_new.pkl',
+                           datasets=['cifar10-valid', 'cifar100', 'ImageNet16-120'],
+                           context_mode=None):
+    """
+    Generate corpus with PyTorch code representations for all 3 primitives modes.
+    
+    Args:
+        output_path: Path to save the corpus (.pkl file)
+        datasets: List of datasets to include metrics for
+        context_mode: None (cell only), 'network' (full code), or 'comment' (docstring)
+    
+    Returns:
+        DataFrame with all architectures and their PyTorch code in 3 primitives modes
+    """
+    api = get_api()
+    context_str = f"with context_mode='{context_mode}'" if context_mode else "without context"
+    print(f"Generating NASBench-201 PyTorch corpus for all primitives modes {context_str}...")
+    print(f"Total architectures: {len(api)}")
+    
+    data_rows = []
+    
+    for arch_idx in tqdm(range(len(api)), desc="Processing architectures"):
+        # Get architecture string
+        arch_string = get_architecture_string(arch_idx)
+        
+        # Generate PyTorch code for all 3 primitives modes
+        pytorch_code_inline = arch_to_pytorch_code(arch_idx, context_mode=context_mode, primitives_mode='inline')
+        pytorch_code_helper = arch_to_pytorch_code(arch_idx, context_mode=context_mode, primitives_mode='helper')
+        pytorch_code_exclude_helper = arch_to_pytorch_code(arch_idx, context_mode=context_mode, primitives_mode='exclude_helper')
+        
+        # Base entry with architecture info and all 3 pytorch code variants
+        entry = {
+            'arch_index': arch_idx,
+            'arch_string': arch_string,
+            'pytorch_code_inline': pytorch_code_inline,
+            'pytorch_code_helper': pytorch_code_helper,
+            'pytorch_code_exclude_helper': pytorch_code_exclude_helper
+        }
+        
+        # Get properties for each dataset and add to entry
+        for dataset in datasets:
+            props = get_arch_properties(arch_idx, dataset=dataset)
+            # Prefix keys with dataset name
+            for key, value in props.items():
+                entry[f'{dataset}_{key}'] = value
+        
+        data_rows.append(entry)
+    
+    # Create DataFrame
+    print(f"\nCreating DataFrame...")
+    df = pd.DataFrame(data_rows)
+    
+    # Save as pickle
+    print(f"Saving corpus to {output_path}")
+    df.to_pickle(output_path)
+    
+    # Also save as CSV
+    csv_path = output_path.replace('.pkl', '.csv')
+    print(f"Saving CSV version to {csv_path}")
+    df.to_csv(csv_path, index=False)
+    
+    # Save first 10 rows as JSON for inspection
+    json_path = output_path.replace('.pkl', '_sample.json')
+    print(f"Saving sample JSON to {json_path}")
+    df.head(10).to_json(json_path, orient='records', indent=2)
+    
+    print(f"\nCorpus generation complete!")
+    print(f"Total entries: {len(df)}")
+    print(f"DataFrame shape: {df.shape}")
+    print(f"\nColumns: {list(df.columns)}")
+    print(f"\nPyTorch code columns:")
+    print(f"  - pytorch_code_inline")
+    print(f"  - pytorch_code_helper")
+    print(f"  - pytorch_code_exclude_helper")
+    
+    return df
 
 if __name__ == "__main__":
     # Generate corpus for all three datasets
