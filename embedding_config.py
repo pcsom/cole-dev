@@ -47,6 +47,41 @@ MODEL_CONFIGS = [
         'sentence_transformer': False
     },
     {
+        'name': 'codellama/CodeLlama-70b-Python-hf',
+        'display_name': 'codellama_python_70b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'codellama/CodeLlama-7b-hf',
+        'display_name': 'codellama_7b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'codellama/CodeLlama-7b-Instruct-hf',
+        'display_name': 'codellama_instruct_7b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'Qwen/Qwen2.5-Coder-7B',
+        'display_name': 'qwen_2_5_coder_7b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'Qwen/Qwen3-Coder-30B-A3B-Instruct',
+        'display_name': 'qwen_3_coder_30b_instruct',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'meta-llama/Llama-3.1-8B',
+        'display_name': 'llama_3_1_8b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'deepseek-ai/deepseek-coder-6.7b-instruct',
+        'display_name': 'deepseek_coder_6_7b_instruct',
+        'sentence_transformer': False
+    },
+    {
         'name': 'Qwen/Qwen2.5-Coder-0.5B',
         'display_name': 'qwen_coder_0_5b',
         'sentence_transformer': False
