@@ -1,6 +1,6 @@
 [submodule "NASLib"]
 	path = NASLib
-	url = https://github.com/automl/NASLib.git
+	url = https://github.com/pcsom/NASlib-coder-nas.git
 [submodule "ONNX-Net"]
 	path = ONNX-Net
 	url = https://github.com/shiwenqin/ONNX-Net.git
