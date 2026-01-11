@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
 from tqdm import tqdm
 import scipy.stats as stats
 from scipy.stats import kendalltau
@@ -26,6 +27,67 @@ from typing import List, Dict, Optional, Tuple
 import os
 from results_io import save_per_embedding_results, save_comparison_results, split_results_for_saving, load_existing_trials
 from stat_utils import corrected_paired_ttest
+
+class FlanPairwiseHingeLoss(nn.Module):
+    """Pairwise hinge loss for learning-to-rank architectures.
+    
+    Implements FLAN-style pairwise ranking loss:
+    - Compares pairs of architectures where accuracies differ
+    - Learns to predict relative ordering (not absolute values)
+    - More robust for architecture search than MSE
+    
+    Args:
+        margin: Minimum difference margin for ranking pairs
+        max_compare_ratio: Maximum number of pairs relative to batch size
+    """
+    def __init__(self, margin=0.1, max_compare_ratio=4.0):
+        super().__init__()
+        self.margin = margin
+        self.max_compare_ratio = max_compare_ratio
+        self.criterion = nn.MarginRankingLoss(margin=margin, reduction='mean')
+
+    def forward(self, pred_scores, target_accs):
+        """
+        Args:
+            pred_scores: (Batch_Size, 1) - The raw model outputs
+            target_accs: (Batch_Size, 1) - The ground truth accuracies
+        """
+        batch_size = pred_scores.size(0)
+        
+        # 1. Generate all pairwise indices (Upper Triangle)
+        acc_np = target_accs.detach().cpu().numpy().flatten()
+        
+        # Calculate differences: matrix[i, j] = acc[i] - acc[j]
+        acc_diff = acc_np[:, None] - acc_np
+        
+        # Get indices where difference is non-zero (triu to avoid duplicates/self)
+        r_idx, c_idx = np.triu_indices(batch_size, k=1)
+        
+        valid_mask = np.abs(acc_diff[r_idx, c_idx]) > 0.0
+        r_idx = r_idx[valid_mask]
+        c_idx = c_idx[valid_mask]
+        
+        # 2. FLAN's "Max Compare Ratio" Sampling Logic
+        # If we have too many pairs, randomly downsample them.
+        n_max_pairs = int(self.max_compare_ratio * batch_size)
+        current_pairs = len(r_idx)
+        
+        if current_pairs > n_max_pairs:
+            # Randomly select a subset of pairs (No replacement, as per FLAN)
+            keep_inds = np.random.choice(current_pairs, n_max_pairs, replace=False)
+            r_idx = r_idx[keep_inds]
+            c_idx = c_idx[keep_inds]
+            
+        # Get scores and squeeze to 1D for MarginRankingLoss
+        s_1 = pred_scores[r_idx].squeeze()
+        s_2 = pred_scores[c_idx].squeeze()
+        
+        target_diff = acc_diff[r_idx, c_idx]
+        target_sign = torch.tensor(np.sign(target_diff), device=pred_scores.device, dtype=torch.float)
+        
+        loss = self.criterion(s_1, s_2, target_sign)
+        
+        return loss
 
 class MLPSurrogate(nn.Module):
     """3-layer MLP for architecture performance prediction."""
@@ -54,7 +116,8 @@ class MLPSurrogate(nn.Module):
 
 def train_model_on_subsample(
     X_train_pool, y_train_pool, X_test, y_test,
-    sample_size, random_state, epochs=100, lr=0.001, batch_size=16, device='cuda', patience=20
+    sample_size, random_state, epochs=100, lr=0.001, batch_size=16, device='cuda', patience=20,
+    apply_pca=False, pca_n_components=None, use_pairwise_loss=False
 ):
     """
     Train a model on a subsample of the training pool.
@@ -76,9 +139,12 @@ def train_model_on_subsample(
         batch_size: Batch size
         device: Device to use
         patience: (Unused, kept for API compatibility)
+        apply_pca: If True, apply PCA dimensionality reduction
+        pca_n_components: Number of PCA components (if None, uses min(n_samples, n_features))
+        use_pairwise_loss: If True, use pairwise hinge loss instead of MSE
     
     Preprocessing:
-        - Features (embeddings): NOT scaled (sensitive distributions)
+        - Features (embeddings): NOT scaled (sensitive distributions), but PCA can be applied
         - Targets (accuracy/loss): Scaled to mean=0, std=1 for balanced gradients
     
     Returns:
@@ -103,6 +169,19 @@ def train_model_on_subsample(
     #   2. Test set is constant size (full fold) for stable evaluation
     #   3. We don't waste data - use all available test samples
     
+    # Apply PCA if requested (before scaling targets)
+    if apply_pca:
+        # Determine number of components
+        if pca_n_components is None:
+            n_components = min(sample_size, X_train.shape[1])
+        else:
+            n_components = min(pca_n_components, sample_size, X_train.shape[1])
+        
+        # Fit PCA on training subsample, transform both train and test
+        pca = PCA(n_components=n_components, random_state=random_state)
+        X_train = pca.fit_transform(X_train)
+        X_test = pca.transform(X_test)
+    
     # Scale TARGETS (not features - embeddings have sensitive distributions)
     target_scaler = StandardScaler()
     y_train_scaled = target_scaler.fit_transform(y_train)
@@ -119,7 +198,12 @@ def train_model_on_subsample(
     model = MLPSurrogate(input_dim=input_dim).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
+    
+    # Select loss criterion
+    if use_pairwise_loss:
+        criterion = FlanPairwiseHingeLoss(margin=0.1, max_compare_ratio=4.0)
+    else:
+        criterion = nn.MSELoss()
     
     # Training loop (fixed epochs, no early stopping)
     model.train()
@@ -131,7 +215,15 @@ def train_model_on_subsample(
             
             optimizer.zero_grad()
             outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
+            
+            # Compute loss based on criterion type
+            if use_pairwise_loss:
+                # Pairwise loss only uses accuracy column (index 1)
+                loss = criterion(outputs[:, 1:2], batch_y[:, 1:2])
+            else:
+                # MSE loss uses both columns
+                loss = criterion(outputs, batch_y)
+            
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -204,7 +296,13 @@ def subsampled_repeated_kfold_comparison(
     random_state=42,
     pairs_to_compute=None,
     trial_data_dict=None,
-    existing_trials_dict=None
+    existing_trials_dict=None,
+    apply_pca_model1=False,
+    apply_pca_model2=False,
+    pca_n_components_model1=None,
+    pca_n_components_model2=None,
+    use_pairwise_loss_model1=False,
+    use_pairwise_loss_model2=False
 ):
     """
     Perform subsampled repeated k-fold CV with corrected statistical testing.
@@ -225,12 +323,19 @@ def subsampled_repeated_kfold_comparison(
         random_state: Base random seed
         existing_results: DataFrame of existing results (optional)
         pairs_to_compute: List of (sample_size, existing_trials, needed_trials) tuples
+        apply_pca_model1: If True, apply PCA to model 1 embeddings
+        apply_pca_model2: If True, apply PCA to model 2 embeddings
+        pca_n_components_model1: Number of PCA components for model 1 (None = auto)
+        pca_n_components_model2: Number of PCA components for model 2 (None = auto)
+        use_pairwise_loss_model1: If True, use pairwise hinge loss for model 1
+        use_pairwise_loss_model2: If True, use pairwise hinge loss for model 2
     
     Methodology:
         - Split First, Subsample Later: K-fold creates train_pool/test, 
           then we subsample EXACTLY sample_size from train_pool
         - Target Scaling: Targets scaled to mean=0, std=1
         - Feature Scaling: None (embeddings have sensitive distributions)
+        - PCA: Optional dimensionality reduction applied per fold
         - Training: Fixed epochs on full subsample, test on full test fold
     
     Returns:
@@ -318,7 +423,10 @@ def subsampled_repeated_kfold_comparison(
                     X1_pool, y_pool, X1_test, y_test,
                     sample_size=min(sample_size, len(X1_pool)),
                     random_state=seed1,
-                    epochs=epochs, lr=lr, batch_size=batch_size, device=device
+                    epochs=epochs, lr=lr, batch_size=batch_size, device=device,
+                    apply_pca=apply_pca_model1,
+                    pca_n_components=pca_n_components_model1,
+                    use_pairwise_loss=use_pairwise_loss_model1
                 )
                 
                 # Train Model 2 on SAME subsample indices
@@ -327,7 +435,10 @@ def subsampled_repeated_kfold_comparison(
                     X2_pool, y_pool, X2_test, y_test,
                     sample_size=min(sample_size, len(X2_pool)),
                     random_state=seed2,
-                    epochs=epochs, lr=lr, batch_size=batch_size, device=device
+                    epochs=epochs, lr=lr, batch_size=batch_size, device=device,
+                    apply_pca=apply_pca_model2,
+                    pca_n_components=pca_n_components_model2,
+                    use_pairwise_loss=use_pairwise_loss_model2
                 )
                 
                 # Store individual scores and difference (using Kendall's Tau)
@@ -345,8 +456,9 @@ def subsampled_repeated_kfold_comparison(
                 diff_mse = result1['mse'] - result2['mse']
                 differences_mse.append(diff_mse)
                 
-                # Track individual NEW trial data for Type 1 CSV saving
+                # Track individual NEW trial data for statistics and Type 1 CSV saving
                 if trial_data_dict is not None:
+                    # Always track trials for statistics (needed for comparison)
                     # Initialize dicts for model1 and model2 if not present
                     if model1_name not in trial_data_dict:
                         trial_data_dict[model1_name] = {}
@@ -377,10 +489,16 @@ def subsampled_repeated_kfold_comparison(
         n_test = len(test_idx)
         
         # Combine existing trials with new trials for statistics calculation
+        # Use only the MINIMUM number of existing trials to ensure arrays match
         existing_m1_trials = existing_trials_dict.get(model1_name, {}).get(sample_size, [])
         existing_m2_trials = existing_trials_dict.get(model2_name, {}).get(sample_size, [])
         new_m1_trials = trial_data_dict.get(model1_name, {}).get(sample_size, [])
         new_m2_trials = trial_data_dict.get(model2_name, {}).get(sample_size, [])
+        
+        # Truncate to minimum existing trials (one model may have more existing trials than the other)
+        min_existing = min(len(existing_m1_trials), len(existing_m2_trials))
+        existing_m1_trials = existing_m1_trials[:min_existing]
+        existing_m2_trials = existing_m2_trials[:min_existing]
         
         all_model1_trials = existing_m1_trials + new_m1_trials
         all_model2_trials = existing_m2_trials + new_m2_trials
@@ -525,7 +643,13 @@ def run_comparison(
     comparison_output_path=None,
     per_embedding_output_dir=None,
     device='cuda',
-    force=False
+    force=False,
+    apply_pca_to_embedding1=False,
+    apply_pca_to_embedding2=False,
+    pca_n_components_embedding1=None,
+    pca_n_components_embedding2=None,
+    use_pairwise_loss_embedding1=False,
+    use_pairwise_loss_embedding2=False
 ):
     """
     Compare two embeddings (same corpus or cross-corpus).
@@ -552,6 +676,12 @@ def run_comparison(
         per_embedding_output_dir: Directory for per-embedding CSVs (Type 1)
         device: Device to use
         force: If True, ignore existing trials and recompute all
+        apply_pca_to_embedding1: If True, apply PCA dimensionality reduction to embedding1
+        apply_pca_to_embedding2: If True, apply PCA dimensionality reduction to embedding2
+        pca_n_components_embedding1: Number of PCA components for embedding1 (None = auto)
+        pca_n_components_embedding2: Number of PCA components for embedding2 (None = auto)
+        use_pairwise_loss_embedding1: If True, use pairwise hinge loss for embedding1
+        use_pairwise_loss_embedding2: If True, use pairwise hinge loss for embedding2
     
     Returns:
         DataFrame with comparison results
@@ -584,8 +714,22 @@ def run_comparison(
         X1 = np.array(df[embedding1_name].tolist()).astype(np.float32)
         X2 = np.array(df[embedding2_name].tolist()).astype(np.float32)
         
+        # Create unique model names with configuration suffixes
+        # This ensures different training configurations are distinguished even for same embedding
         model1_name = embedding1_name
+        if apply_pca_to_embedding1:
+            n_comp = pca_n_components_embedding1 if pca_n_components_embedding1 else 'auto'
+            model1_name = f"{model1_name}_pca{n_comp}"
+        if use_pairwise_loss_embedding1:
+            model1_name = f"{model1_name}_pairwise"
+        
         model2_name = embedding2_name
+        if apply_pca_to_embedding2:
+            n_comp = pca_n_components_embedding2 if pca_n_components_embedding2 else 'auto'
+            model2_name = f"{model2_name}_pca{n_comp}"
+        if use_pairwise_loss_embedding2:
+            model2_name = f"{model2_name}_pairwise"
+        
         corpus1 = corpus_path1
         corpus2 = corpus_path1
         
@@ -612,8 +756,21 @@ def run_comparison(
         X1 = np.array(df1[embedding1_name].tolist()).astype(np.float32)
         X2 = np.array(df2[embedding2_name].tolist()).astype(np.float32)
         
+        # Create unique model names with corpus and configuration suffixes
         model1_name = f"{embedding1_name}_corpus1"
+        if apply_pca_to_embedding1:
+            n_comp = pca_n_components_embedding1 if pca_n_components_embedding1 else 'auto'
+            model1_name = f"{model1_name}_pca{n_comp}"
+        if use_pairwise_loss_embedding1:
+            model1_name = f"{model1_name}_pairwise"
+        
         model2_name = f"{embedding2_name}_corpus2"
+        if apply_pca_to_embedding2:
+            n_comp = pca_n_components_embedding2 if pca_n_components_embedding2 else 'auto'
+            model2_name = f"{model2_name}_pca{n_comp}"
+        if use_pairwise_loss_embedding2:
+            model2_name = f"{model2_name}_pairwise"
+        
         corpus1 = corpus_path1
         corpus2 = corpus_path2
         df = df1  # Use first dataframe for targets
@@ -634,16 +791,27 @@ def run_comparison(
     print(f"{'='*80}\n")
     
     # Load existing trials from Type 1 CSVs
+    # NOTE: Type 1 CSVs only contain raw embeddings (no PCA, no pairwise loss)
+    # Only load existing trials if model name matches original embedding name (no transformations)
     existing_trials_dict = {}  # Existing trials loaded from disk
     new_trials_dict = {}  # New trials to be computed and saved
     if not force and per_embedding_output_dir:
         print(f"Loading existing trials from Type 1 CSVs...")
-        existing_trials_dict[model1_name] = load_existing_trials(
-            per_embedding_output_dir, embedding1_name, corpus1_name
-        )
-        existing_trials_dict[model2_name] = load_existing_trials(
-            per_embedding_output_dir, embedding2_name, corpus2_name
-        )
+        
+        # Only load if model name matches original (no config suffixes = no transformations)
+        if model1_name == embedding1_name:
+            existing_trials_dict[model1_name] = load_existing_trials(
+                per_embedding_output_dir, embedding1_name, corpus1_name
+            )
+        else:
+            existing_trials_dict[model1_name] = {}  # No existing trials for transformed configs
+            
+        if model2_name == embedding2_name:
+            existing_trials_dict[model2_name] = load_existing_trials(
+                per_embedding_output_dir, embedding2_name, corpus2_name
+            )
+        else:
+            existing_trials_dict[model2_name] = {}  # No existing trials for transformed configs
         
         total_m1 = sum(len(trials) for trials in existing_trials_dict[model1_name].values())
         total_m2 = sum(len(trials) for trials in existing_trials_dict[model2_name].values())
@@ -653,6 +821,30 @@ def run_comparison(
     # Prepare X dict
     X = {model1_name: X1, model2_name: X2}
     embedding_types = [model1_name, model2_name]
+    
+    # Print PCA and pairwise loss info if enabled
+    if apply_pca_to_embedding1 or apply_pca_to_embedding2 or use_pairwise_loss_embedding1 or use_pairwise_loss_embedding2:
+        print(f"\nConfiguration:")
+        if apply_pca_to_embedding1:
+            comp1 = pca_n_components_embedding1 if pca_n_components_embedding1 else "auto"
+            print(f"  {model1_name}: PCA enabled, n_components={comp1}")
+        else:
+            print(f"  {model1_name}: PCA disabled")
+        if use_pairwise_loss_embedding1:
+            print(f"  {model1_name}: Pairwise hinge loss enabled")
+        else:
+            print(f"  {model1_name}: MSE loss")
+            
+        if apply_pca_to_embedding2:
+            comp2 = pca_n_components_embedding2 if pca_n_components_embedding2 else "auto"
+            print(f"  {model2_name}: PCA enabled, n_components={comp2}")
+        else:
+            print(f"  {model2_name}: PCA disabled")
+        if use_pairwise_loss_embedding2:
+            print(f"  {model2_name}: Pairwise hinge loss enabled")
+        else:
+            print(f"  {model2_name}: MSE loss")
+        print()
     
     # Run comparison (new_trials_dict will be populated with NEW trials only)
     result_df = subsampled_repeated_kfold_comparison(
@@ -665,20 +857,33 @@ def run_comparison(
         device=device,
         pairs_to_compute=None,
         trial_data_dict=new_trials_dict,
-        existing_trials_dict=existing_trials_dict
+        existing_trials_dict=existing_trials_dict,
+        apply_pca_model1=apply_pca_to_embedding1,
+        apply_pca_model2=apply_pca_to_embedding2,
+        pca_n_components_model1=pca_n_components_embedding1,
+        pca_n_components_model2=pca_n_components_embedding2,
+        use_pairwise_loss_model1=use_pairwise_loss_embedding1,
+        use_pairwise_loss_model2=use_pairwise_loss_embedding2
     )
     
     # Add metadata
     result_df['comparison_type'] = comparison_label
-    result_df['embedding1'] = embedding1_name
-    result_df['embedding2'] = embedding2_name
+    
+    # Use model names for display (already have config suffixes: _pca64, _pairwise, etc.)
+    # Strip corpus suffix if present (for cross-corpus comparisons)
+    embedding1_display = model1_name.replace('_corpus1', '')
+    embedding2_display = model2_name.replace('_corpus2', '')
+    
+    result_df['embedding1'] = embedding1_display
+    result_df['embedding2'] = embedding2_display
     result_df['corpus1'] = corpus1_name
     result_df['corpus2'] = corpus2_name
+
     
     # Split and save results - use new_trials_dict which contains ONLY new trials
     per_embedding_dict, comparison_df = split_results_for_saving(result_df, new_trials_dict)
     
-    # Save Type 1: Per-embedding results (only NEW trials)
+    # Save Type 1: Per-embedding results (only NEW trials, skip if transformed)
     if per_embedding_output_dir:
         print(f"\nSaving per-embedding results (Type 1)...")
         for embedding_name, emb_df in per_embedding_dict.items():
@@ -690,6 +895,11 @@ def run_comparison(
                 else:
                     corpus_name = corpus2_name
                     actual_embedding_name = embedding2_name
+                
+                # Skip if model name differs from original (has config suffixes = transformed)
+                if embedding_name != actual_embedding_name:
+                    print(f"  Skipping {embedding_name} (transformed config, not raw embedding)")
+                    continue
                 
                 save_per_embedding_results(emb_df, per_embedding_output_dir, 
                                           actual_embedding_name, corpus_name)
