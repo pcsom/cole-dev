@@ -117,7 +117,7 @@ class MLPSurrogate(nn.Module):
 def train_model_on_subsample(
     X_train_pool, y_train_pool, X_test, y_test,
     sample_size, random_state, epochs=100, lr=0.001, batch_size=16, device='cuda', patience=20,
-    apply_pca=False, pca_n_components=None, use_pairwise_loss=False
+    apply_pca=False, pca_n_components=None, use_pairwise_loss=False, use_single_target=False
 ):
     """
     Train a model on a subsample of the training pool.
@@ -142,6 +142,7 @@ def train_model_on_subsample(
         apply_pca: If True, apply PCA dimensionality reduction
         pca_n_components: Number of PCA components (if None, uses min(n_samples, n_features))
         use_pairwise_loss: If True, use pairwise hinge loss instead of MSE
+        use_single_target: If True, train only on valid accuracy (single target) instead of both loss and accuracy
     
     Preprocessing:
         - Features (embeddings): NOT scaled (sensitive distributions), but PCA can be applied
@@ -161,6 +162,11 @@ def train_model_on_subsample(
     indices = np.random.choice(n_pool, size=sample_size, replace=False)
     X_train = X_train_pool[indices]
     y_train = y_train_pool[indices]
+    
+    # Extract only accuracy column if single target mode
+    if use_single_target:
+        y_train = y_train[:, 1:2]  # Keep 2D shape (N, 1) for consistency
+        y_test = y_test[:, 1:2]
     
     # CRITICAL: Split First, Subsample Later methodology
     # The subsample IS the full training set. We do NOT split it further.
@@ -187,15 +193,18 @@ def train_model_on_subsample(
     y_train_scaled = target_scaler.fit_transform(y_train)
     y_test_scaled = target_scaler.transform(y_test)
     
+    # call nvidia-smi to debug mem usage
+    # os.system("nvidia-smi")
     # Convert to tensors (features are NOT scaled)
     X_train_t = torch.FloatTensor(X_train).to(device)
     y_train_t = torch.FloatTensor(y_train_scaled).to(device)
     X_test_t = torch.FloatTensor(X_test).to(device)
     y_test_t = torch.FloatTensor(y_test_scaled).to(device)
     
-    # Create model
+    # Create model with appropriate output dimension
     input_dim = X_train.shape[1]
-    model = MLPSurrogate(input_dim=input_dim).to(device)
+    output_dim = 1 if use_single_target else 2
+    model = MLPSurrogate(input_dim=input_dim, output_dim=output_dim).to(device)
     
     optimizer = optim.Adam(model.parameters(), lr=lr)
     
@@ -216,12 +225,14 @@ def train_model_on_subsample(
             optimizer.zero_grad()
             outputs = model(batch_X)
             
-            # Compute loss based on criterion type
+            # Compute loss (works for both single and dual target)
             if use_pairwise_loss:
-                # Pairwise loss only uses accuracy column (index 1)
-                loss = criterion(outputs[:, 1:2], batch_y[:, 1:2])
+                # Pairwise loss: if single target, outputs is (N,1), otherwise use accuracy column
+                target_col = outputs if use_single_target else outputs[:, 1:2]
+                batch_target = batch_y if use_single_target else batch_y[:, 1:2]
+                loss = criterion(target_col, batch_target)
             else:
-                # MSE loss uses both columns
+                # MSE loss: works for both (N,1) and (N,2)
                 loss = criterion(outputs, batch_y)
             
             loss.backward()
@@ -238,9 +249,13 @@ def train_model_on_subsample(
         test_pred = target_scaler.inverse_transform(test_pred_scaled)
         test_true = y_test
         
-        # Calculate metrics (for accuracy prediction - 2nd column)
-        acc_pred = test_pred[:, 1]
-        acc_true = test_true[:, 1]
+        # Calculate metrics (for accuracy prediction)
+        if use_single_target:
+            acc_pred = test_pred[:, 0]  # Single column output
+            acc_true = test_true[:, 0]  # Single column target
+        else:
+            acc_pred = test_pred[:, 1]  # Second column (accuracy)
+            acc_true = test_true[:, 1]
         
         # 1. Check for NaNs in output (Gradient explosion)
         if np.any(np.isnan(acc_pred)):
@@ -302,7 +317,9 @@ def subsampled_repeated_kfold_comparison(
     pca_n_components_model1=None,
     pca_n_components_model2=None,
     use_pairwise_loss_model1=False,
-    use_pairwise_loss_model2=False
+    use_pairwise_loss_model2=False,
+    use_single_target_model1=False,
+    use_single_target_model2=False
 ):
     """
     Perform subsampled repeated k-fold CV with corrected statistical testing.
@@ -329,6 +346,8 @@ def subsampled_repeated_kfold_comparison(
         pca_n_components_model2: Number of PCA components for model 2 (None = auto)
         use_pairwise_loss_model1: If True, use pairwise hinge loss for model 1
         use_pairwise_loss_model2: If True, use pairwise hinge loss for model 2
+        use_single_target_model1: If True, train model 1 only on valid accuracy
+        use_single_target_model2: If True, train model 2 only on valid accuracy
     
     Methodology:
         - Split First, Subsample Later: K-fold creates train_pool/test, 
@@ -426,7 +445,8 @@ def subsampled_repeated_kfold_comparison(
                     epochs=epochs, lr=lr, batch_size=batch_size, device=device,
                     apply_pca=apply_pca_model1,
                     pca_n_components=pca_n_components_model1,
-                    use_pairwise_loss=use_pairwise_loss_model1
+                    use_pairwise_loss=use_pairwise_loss_model1,
+                    use_single_target=use_single_target_model1
                 )
                 
                 # Train Model 2 on SAME subsample indices
@@ -438,7 +458,8 @@ def subsampled_repeated_kfold_comparison(
                     epochs=epochs, lr=lr, batch_size=batch_size, device=device,
                     apply_pca=apply_pca_model2,
                     pca_n_components=pca_n_components_model2,
-                    use_pairwise_loss=use_pairwise_loss_model2
+                    use_pairwise_loss=use_pairwise_loss_model2,
+                    use_single_target=use_single_target_model2
                 )
                 
                 # Store individual scores and difference (using Kendall's Tau)
@@ -649,7 +670,9 @@ def run_comparison(
     pca_n_components_embedding1=None,
     pca_n_components_embedding2=None,
     use_pairwise_loss_embedding1=False,
-    use_pairwise_loss_embedding2=False
+    use_pairwise_loss_embedding2=False,
+    use_single_target_embedding1=False,
+    use_single_target_embedding2=False
 ):
     """
     Compare two embeddings (same corpus or cross-corpus).
@@ -682,6 +705,8 @@ def run_comparison(
         pca_n_components_embedding2: Number of PCA components for embedding2 (None = auto)
         use_pairwise_loss_embedding1: If True, use pairwise hinge loss for embedding1
         use_pairwise_loss_embedding2: If True, use pairwise hinge loss for embedding2
+        use_single_target_embedding1: If True, train embedding1 model only on valid accuracy
+        use_single_target_embedding2: If True, train embedding2 model only on valid accuracy
     
     Returns:
         DataFrame with comparison results
@@ -722,6 +747,8 @@ def run_comparison(
             model1_name = f"{model1_name}_pca{n_comp}"
         if use_pairwise_loss_embedding1:
             model1_name = f"{model1_name}_pairwise"
+        if use_single_target_embedding1:
+            model1_name = f"{model1_name}_singletarget"
         
         model2_name = embedding2_name
         if apply_pca_to_embedding2:
@@ -729,6 +756,8 @@ def run_comparison(
             model2_name = f"{model2_name}_pca{n_comp}"
         if use_pairwise_loss_embedding2:
             model2_name = f"{model2_name}_pairwise"
+        if use_single_target_embedding2:
+            model2_name = f"{model2_name}_singletarget"
         
         corpus1 = corpus_path1
         corpus2 = corpus_path1
@@ -763,6 +792,8 @@ def run_comparison(
             model1_name = f"{model1_name}_pca{n_comp}"
         if use_pairwise_loss_embedding1:
             model1_name = f"{model1_name}_pairwise"
+        if use_single_target_embedding1:
+            model1_name = f"{model1_name}_singletarget"
         
         model2_name = f"{embedding2_name}_corpus2"
         if apply_pca_to_embedding2:
@@ -770,6 +801,8 @@ def run_comparison(
             model2_name = f"{model2_name}_pca{n_comp}"
         if use_pairwise_loss_embedding2:
             model2_name = f"{model2_name}_pairwise"
+        if use_single_target_embedding2:
+            model2_name = f"{model2_name}_singletarget"
         
         corpus1 = corpus_path1
         corpus2 = corpus_path2
@@ -822,28 +855,28 @@ def run_comparison(
     X = {model1_name: X1, model2_name: X2}
     embedding_types = [model1_name, model2_name]
     
-    # Print PCA and pairwise loss info if enabled
-    if apply_pca_to_embedding1 or apply_pca_to_embedding2 or use_pairwise_loss_embedding1 or use_pairwise_loss_embedding2:
+    # Print PCA, pairwise loss, and single target info if enabled
+    if apply_pca_to_embedding1 or apply_pca_to_embedding2 or use_pairwise_loss_embedding1 or use_pairwise_loss_embedding2 or use_single_target_embedding1 or use_single_target_embedding2:
         print(f"\nConfiguration:")
         if apply_pca_to_embedding1:
             comp1 = pca_n_components_embedding1 if pca_n_components_embedding1 else "auto"
             print(f"  {model1_name}: PCA enabled, n_components={comp1}")
-        else:
-            print(f"  {model1_name}: PCA disabled")
         if use_pairwise_loss_embedding1:
             print(f"  {model1_name}: Pairwise hinge loss enabled")
+        if use_single_target_embedding1:
+            print(f"  {model1_name}: Single target (valid accuracy only)")
         else:
-            print(f"  {model1_name}: MSE loss")
+            print(f"  {model1_name}: Dual target (loss + accuracy)")
             
         if apply_pca_to_embedding2:
             comp2 = pca_n_components_embedding2 if pca_n_components_embedding2 else "auto"
             print(f"  {model2_name}: PCA enabled, n_components={comp2}")
-        else:
-            print(f"  {model2_name}: PCA disabled")
         if use_pairwise_loss_embedding2:
             print(f"  {model2_name}: Pairwise hinge loss enabled")
+        if use_single_target_embedding2:
+            print(f"  {model2_name}: Single target (valid accuracy only)")
         else:
-            print(f"  {model2_name}: MSE loss")
+            print(f"  {model2_name}: Dual target (loss + accuracy)")
         print()
     
     # Run comparison (new_trials_dict will be populated with NEW trials only)
@@ -863,7 +896,9 @@ def run_comparison(
         pca_n_components_model1=pca_n_components_embedding1,
         pca_n_components_model2=pca_n_components_embedding2,
         use_pairwise_loss_model1=use_pairwise_loss_embedding1,
-        use_pairwise_loss_model2=use_pairwise_loss_embedding2
+        use_pairwise_loss_model2=use_pairwise_loss_embedding2,
+        use_single_target_model1=use_single_target_embedding1,
+        use_single_target_model2=use_single_target_embedding2
     )
     
     # Add metadata
