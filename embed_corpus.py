@@ -216,7 +216,7 @@ def get_embeddings_sentence_transformers(texts, model, batch_size=16):
     return embeddings
 
 def embed_with_model(df, model_name, model_display_name, device='cuda', force=None, pytorch_only=False, 
-                     use_sentence_transformers=False, use_quantization=True, use_echo_embeddings=False,
+                     onnx_only=False, use_sentence_transformers=False, use_quantization=True, use_echo_embeddings=False,
                      pytorch_context_mode=None, max_length=2048):
     """
     Add embeddings from a specific model to the dataframe.
@@ -229,6 +229,7 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         force: If True, force recompute even if embeddings exist. 
                If None, uses FORCE_RECOMPUTE_EMBEDDINGS from config.
         pytorch_only: If True, only embed pytorch_code
+        onnx_only: If True, only embed true_onnx_encoding (or columns containing 'onnx')
         use_sentence_transformers: If True, use sentence-transformers library instead of transformers
         use_quantization: If True, use 8-bit quantization for transformers models
         use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
@@ -249,6 +250,13 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
             print("WARNING: pytorch_only=True but no pytorch columns found in dataframe")
             code_types = ['pytorch_code']  # fallback
         print(f"Processing pytorch columns: {code_types}")
+    elif onnx_only:
+        # Only embed the specific true_onnx_encoding column
+        code_types = ['true_onnx_encoding']
+        if 'true_onnx_encoding' not in df.columns:
+            print("WARNING: onnx_only=True but 'true_onnx_encoding' column not found in dataframe")
+            print(f"Available columns: {list(df.columns)}")
+        print(f"Processing ONNX column: {code_types}")
     else:
         code_types = ['pytorch_code', 'onnx_code', 'grammar_code']
     
@@ -558,6 +566,7 @@ def add_embeddings_to_corpus(
     device='cuda',
     force=None,
     pytorch_only=False,
+    onnx_only=False,
     use_echo_embeddings=False,
     use_quantization=True,
     pytorch_context_mode=None,
@@ -580,6 +589,7 @@ def add_embeddings_to_corpus(
         force: If True, force recompute even if embeddings exist.
                If None, uses FORCE_RECOMPUTE_EMBEDDINGS from config.
         pytorch_only: If True, only embed pytorch_code
+        onnx_only: If True, only embed true_onnx_encoding (or columns containing 'onnx')
         use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
         use_quantization: If True, use 8-bit quantization for transformer models (ignored for sentence-transformers)
         pytorch_context_mode: None (default), "network" (add full Network code), or "comment" (add docstring).
@@ -619,14 +629,23 @@ def add_embeddings_to_corpus(
         df_output = df_source.copy()
     
     # Build expected embedding column names based on context mode
-    # Find all columns in dataframe that contain 'pytorch' in their name
-    code_types = [col for col in df_source.columns if 'pytorch' in col.lower() and not col.endswith('_embedding')]
-    if not code_types:
-        print("WARNING: pytorch_only=True but no pytorch columns found in dataframe")
-        code_types = ['pytorch_code']  # fallback
-    print(f"Processing pytorch columns: {code_types}")
-    if not pytorch_only:
-        code_types.extend(['onnx_code', 'grammar_code'])
+    # This MUST match the logic in embed_with_model to avoid losing columns!
+    if pytorch_only:
+        # Find all columns in dataframe that contain 'pytorch' in their name
+        code_types = [col for col in df_source.columns if 'pytorch' in col.lower() and not col.endswith('_embedding')]
+        if not code_types:
+            print("WARNING: pytorch_only=True but no pytorch columns found in dataframe")
+            code_types = ['pytorch_code']  # fallback
+        print(f"Processing pytorch columns: {code_types}")
+    elif onnx_only:
+        # Only embed the specific true_onnx_encoding column
+        code_types = ['true_onnx_encoding']
+        if 'true_onnx_encoding' not in df_source.columns:
+            print("WARNING: onnx_only=True but 'true_onnx_encoding' column not found in dataframe")
+            print(f"Available columns: {list(df_source.columns)}")
+        print(f"Processing ONNX column: {code_types}")
+    else:
+        code_types = ['pytorch_code', 'onnx_code', 'grammar_code']
     
     expected_embedding_cols = []
     for ct in code_types:
@@ -682,6 +701,7 @@ def add_embeddings_to_corpus(
         use_sentence_transformers=model_config.get('sentence_transformer', False),
         use_quantization=use_quantization,
         pytorch_only=pytorch_only,
+        onnx_only=onnx_only,
         use_echo_embeddings=use_echo_embeddings,
         pytorch_context_mode=pytorch_context_mode,
         max_length=max_length
