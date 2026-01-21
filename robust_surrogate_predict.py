@@ -27,6 +27,8 @@ from typing import List, Dict, Optional, Tuple
 import os
 from results_io import save_per_embedding_results, save_comparison_results, split_results_for_saving, load_existing_trials
 from stat_utils import corrected_paired_ttest
+from zca import ZCAWhitening
+from heads import MLPSurrogate, XGBoostSurrogate, MultiLayerPerceiverSurrogate
 
 class FlanPairwiseHingeLoss(nn.Module):
     """Pairwise hinge loss for learning-to-rank architectures.
@@ -89,35 +91,12 @@ class FlanPairwiseHingeLoss(nn.Module):
         
         return loss
 
-class MLPSurrogate(nn.Module):
-    """3-layer MLP for architecture performance prediction."""
-    
-    def __init__(self, input_dim, hidden_dims=[512, 256, 128], output_dim=2, dropout=0.1):
-        super(MLPSurrogate, self).__init__()
-        
-        layers = []
-        prev_dim = input_dim
-        
-        for hidden_dim in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hidden_dim),
-                nn.LeakyReLU(negative_slope=0.01),
-                nn.Dropout(dropout)
-            ])
-            prev_dim = hidden_dim
-        
-        layers.append(nn.Linear(prev_dim, output_dim))
-        
-        self.network = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        return self.network(x)
-
 
 def train_model_on_subsample(
     X_train_pool, y_train_pool, X_test, y_test,
     sample_size, random_state, epochs=100, lr=0.001, batch_size=16, device='cuda', patience=20,
-    apply_pca=False, pca_n_components=None, use_pairwise_loss=False, use_single_target=False
+    apply_pca=False, pca_n_components=None, apply_zca=False, zca_epsilon=0.1, use_pairwise_loss=False, use_single_target=False,
+    head_type='mlp'
 ):
     """
     Train a model on a subsample of the training pool.
@@ -143,6 +122,7 @@ def train_model_on_subsample(
         pca_n_components: Number of PCA components (if None, uses min(n_samples, n_features))
         use_pairwise_loss: If True, use pairwise hinge loss instead of MSE
         use_single_target: If True, train only on valid accuracy (single target) instead of both loss and accuracy
+        head_type: Type of head to use ('mlp', 'xgboost', or 'perceiver')
     
     Preprocessing:
         - Features (embeddings): NOT scaled (sensitive distributions), but PCA can be applied
@@ -174,80 +154,177 @@ def train_model_on_subsample(
     #   1. Training size is exactly what's specified (15, 50, 150, etc.)
     #   2. Test set is constant size (full fold) for stable evaluation
     #   3. We don't waste data - use all available test samples
+
+    is_multilayer = (X_train.ndim == 3)
+
+    if apply_zca: 
+        # Initialize Soft-ZCA with the specified epsilon
+        zca = ZCAWhitening(epsilon=zca_epsilon)
+        
+        if is_multilayer:
+            # --- SHARED-BASIS ZCA FOR MULTI-LAYER ---
+            N_train, L_train, D_dim = X_train.shape
+            N_test, L_test, _ = X_test.shape
+            
+            # 1. Flatten Layers into the Batch dimension
+            # We treat every layer of every sample as an independent observation 
+            # to learn a single, global whitening transformation.
+            X_train_flat = X_train.reshape(-1, D_dim) # (N*L, Dim)
+            X_test_flat = X_test.reshape(-1, D_dim)   # (M*L, Dim)
+            
+            # 2. Fit and Transform on flattened data
+            # The ZCA matrix is learned from the combined statistics of all layers
+            X_train_flat = zca.fit_transform(X_train_flat)
+            X_test_flat = zca.transform(X_test_flat)
+            
+            # 3. Reshape back to 3D
+            # ZCA preserves dimensionality, so D_dim remains the same
+            X_train = X_train_flat.reshape(N_train, L_train, D_dim)
+            X_test = X_test_flat.reshape(N_test, L_test, D_dim)
+            
+            print(f"  Multi-layer ZCA: Whitened {D_dim} dims (Shared Basis, eps={zca_epsilon})")
+            
+        else:
+            # --- STANDARD 2D ZCA ---
+            # Fit on TRAIN ONLY, then transform both train and test
+            # This prevents data leakage from test set statistics
+            X_train = zca.fit_transform(X_train)
+            X_test = zca.transform(X_test)
     
     # Apply PCA if requested (before scaling targets)
     if apply_pca:
-        # Determine number of components
-        if pca_n_components is None:
-            n_components = min(sample_size, X_train.shape[1])
+        if is_multilayer:
+            # --- SHARED-BASIS PCA FOR MULTI-LAYER ---
+            N_train, L_train, D_dim = X_train.shape
+            N_test, L_test, _ = X_test.shape
+            
+            # 1. Flatten Layers into the Batch dimension
+            # We treat every layer of every sample as a data point to learn the basis
+            X_train_flat = X_train.reshape(-1, D_dim) # (N*L, 4096)
+            X_test_flat = X_test.reshape(-1, D_dim)   # (N*L, 4096)
+            
+            # 2. Determine components based on effective sample size or explicit arg
+            if pca_n_components is None:
+                raise ValueError("pca_n_components must be specified if apply_pca is True")
+            else:
+                n_components = min(pca_n_components, X_train_flat.shape[0], X_train_flat.shape[1])
+            
+            # 3. Fit PCA on flattened training data
+            pca = PCA(n_components=n_components, random_state=random_state)
+            X_train_flat = pca.fit_transform(X_train_flat)
+            X_test_flat = pca.transform(X_test_flat)
+            
+            # 4. Reshape back to 3D
+            # New shape: (N, L, n_components)
+            X_train = X_train_flat.reshape(N_train, L_train, -1)
+            X_test = X_test_flat.reshape(N_test, L_test, -1)
+            
+            print(f"  Multi-layer PCA: Reduced {D_dim} -> {X_train.shape[2]} dims (Shared Basis)")
         else:
+            # Determine number of components
+            if pca_n_components is None:
+                raise ValueError("pca_n_components must be specified if apply_pca is True")
             n_components = min(pca_n_components, sample_size, X_train.shape[1])
-        
-        # Fit PCA on training subsample, transform both train and test
-        pca = PCA(n_components=n_components, random_state=random_state)
-        X_train = pca.fit_transform(X_train)
-        X_test = pca.transform(X_test)
+            
+            # Fit PCA on training subsample, transform both train and test
+            pca = PCA(n_components=n_components, random_state=random_state)
+            X_train = pca.fit_transform(X_train)
+            X_test = pca.transform(X_test)
     
     # Scale TARGETS (not features - embeddings have sensitive distributions)
     target_scaler = StandardScaler()
     y_train_scaled = target_scaler.fit_transform(y_train)
     y_test_scaled = target_scaler.transform(y_test)
     
-    # call nvidia-smi to debug mem usage
-    # os.system("nvidia-smi")
-    # Convert to tensors (features are NOT scaled)
-    X_train_t = torch.FloatTensor(X_train).to(device)
-    y_train_t = torch.FloatTensor(y_train_scaled).to(device)
-    X_test_t = torch.FloatTensor(X_test).to(device)
-    y_test_t = torch.FloatTensor(y_test_scaled).to(device)
-    
     # Create model with appropriate output dimension
     input_dim = X_train.shape[1]
     output_dim = 1 if use_single_target else 2
-    model = MLPSurrogate(input_dim=input_dim, output_dim=output_dim).to(device)
     
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    
-    # Select loss criterion
-    if use_pairwise_loss:
-        criterion = FlanPairwiseHingeLoss(margin=0.1, max_compare_ratio=4.0)
+    # Select head type
+    if head_type == 'mlp':
+        model = MLPSurrogate(input_dim=input_dim, output_dim=output_dim).to(device)
+    elif head_type == 'xgboost':
+        model = XGBoostSurrogate(input_dim=input_dim, output_dim=output_dim, 
+                                random_state=random_state, device=device)
+    elif head_type == 'perceiver':
+        # For perceiver, X_train should be 3D: (N, num_layers, hidden_dim)
+        # If it's 2D, we can't use perceiver - fall back to MLP
+        if len(X_train.shape) == 3:
+            num_layers = X_train.shape[1]
+            model = MultiLayerPerceiverSurrogate(
+                input_dim=input_dim, 
+                num_layers_to_pool=num_layers,
+                output_dim=output_dim
+            ).to(device)
+        else:
+            raise ValueError("Perceiver head requires 3D input (N, num_layers, hidden_dim).")
     else:
-        criterion = nn.MSELoss()
+        raise ValueError(f"Unknown head_type: {head_type}. Must be 'mlp', 'xgboost', or 'perceiver'")
     
-    # Training loop (fixed epochs, no early stopping)
-    model.train()
-    for epoch in range(epochs):
-        # Mini-batch training
-        for i in range(0, len(X_train_t), batch_size):
-            batch_X = X_train_t[i:i+batch_size]
-            batch_y = y_train_t[i:i+batch_size]
-            
-            optimizer.zero_grad()
-            outputs = model(batch_X)
-            
-            # Compute loss (works for both single and dual target)
-            if use_pairwise_loss:
-                # Pairwise loss: if single target, outputs is (N,1), otherwise use accuracy column
-                target_col = outputs if use_single_target else outputs[:, 1:2]
-                batch_target = batch_y if use_single_target else batch_y[:, 1:2]
-                loss = criterion(target_col, batch_target)
-            else:
-                # MSE loss: works for both (N,1) and (N,2)
-                loss = criterion(outputs, batch_y)
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-    
-    # Evaluation on test set
-    model.eval()
-    with torch.no_grad():
-        # Test set predictions (in scaled space)
-        test_pred_scaled = model(X_test_t).cpu().numpy()
+    # XGBoost has different training procedure
+    if head_type == 'xgboost':
+        # XGBoost doesn't need tensor conversion or epochs
+        # Fit directly on scaled numpy arrays
+        model.fit(X_train, y_train_scaled)
+        
+        # Predict on test set (in scaled space)
+        test_pred_scaled = model.predict(X_test)
         
         # Inverse transform to original scale
         test_pred = target_scaler.inverse_transform(test_pred_scaled)
         test_true = y_test
+    else:
+        # PyTorch-based models (MLP, Perceiver)
+        # call nvidia-smi to debug mem usage
+        # os.system("nvidia-smi")
+        # Convert to tensors (features are NOT scaled)
+        X_train_t = torch.FloatTensor(X_train).to(device)
+        y_train_t = torch.FloatTensor(y_train_scaled).to(device)
+        X_test_t = torch.FloatTensor(X_test).to(device)
+        y_test_t = torch.FloatTensor(y_test_scaled).to(device)
+        
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        
+        # Select loss criterion
+        if use_pairwise_loss:
+            criterion = FlanPairwiseHingeLoss(margin=0.1, max_compare_ratio=4.0)
+        else:
+            criterion = nn.MSELoss()
+        
+        # Training loop (fixed epochs, no early stopping)
+        model.train()
+        for epoch in range(epochs):
+            # Mini-batch training
+            for i in range(0, len(X_train_t), batch_size):
+                batch_X = X_train_t[i:i+batch_size]
+                batch_y = y_train_t[i:i+batch_size]
+                
+                optimizer.zero_grad()
+                outputs = model(batch_X)
+                
+                # Compute loss (works for both single and dual target)
+                if use_pairwise_loss:
+                    # Pairwise loss: if single target, outputs is (N,1), otherwise use accuracy column
+                    target_col = outputs if use_single_target else outputs[:, 1:2]
+                    batch_target = batch_y if use_single_target else batch_y[:, 1:2]
+                    loss = criterion(target_col, batch_target)
+                else:
+                    # MSE loss: works for both (N,1) and (N,2)
+                    loss = criterion(outputs, batch_y)
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+        
+        # Evaluation on test set
+        model.eval()
+        with torch.no_grad():
+            # Test set predictions (in scaled space)
+            test_pred_scaled = model(X_test_t).cpu().numpy()
+            
+            # Inverse transform to original scale
+            test_pred = target_scaler.inverse_transform(test_pred_scaled)
+            test_true = y_test
         
         # Calculate metrics (for accuracy prediction)
         if use_single_target:
@@ -316,10 +393,16 @@ def subsampled_repeated_kfold_comparison(
     apply_pca_model2=False,
     pca_n_components_model1=None,
     pca_n_components_model2=None,
+    apply_zca_model1=False,
+    apply_zca_model2=False,
+    zca_epsilon_model1=0.1,
+    zca_epsilon_model2=0.1,
     use_pairwise_loss_model1=False,
     use_pairwise_loss_model2=False,
     use_single_target_model1=False,
-    use_single_target_model2=False
+    use_single_target_model2=False,
+    head_type_model1='mlp',
+    head_type_model2='mlp'
 ):
     """
     Perform subsampled repeated k-fold CV with corrected statistical testing.
@@ -344,10 +427,16 @@ def subsampled_repeated_kfold_comparison(
         apply_pca_model2: If True, apply PCA to model 2 embeddings
         pca_n_components_model1: Number of PCA components for model 1 (None = auto)
         pca_n_components_model2: Number of PCA components for model 2 (None = auto)
+        apply_zca_model1: If True, apply ZCA whitening to model 1 embeddings
+        apply_zca_model2: If True, apply ZCA whitening to model 2 embeddings
+        zca_epsilon_model1: Epsilon for ZCA whitening regularization for model 1
+        zca_epsilon_model2: Epsilon for ZCA whitening regularization for model 2
         use_pairwise_loss_model1: If True, use pairwise hinge loss for model 1
         use_pairwise_loss_model2: If True, use pairwise hinge loss for model 2
         use_single_target_model1: If True, train model 1 only on valid accuracy
         use_single_target_model2: If True, train model 2 only on valid accuracy
+        head_type_model1: Type of head for model 1 ('mlp', 'xgboost', or 'perceiver')
+        head_type_model2: Type of head for model 2 ('mlp', 'xgboost', or 'perceiver')
     
     Methodology:
         - Split First, Subsample Later: K-fold creates train_pool/test, 
@@ -445,8 +534,11 @@ def subsampled_repeated_kfold_comparison(
                     epochs=epochs, lr=lr, batch_size=batch_size, device=device,
                     apply_pca=apply_pca_model1,
                     pca_n_components=pca_n_components_model1,
+                    apply_zca=apply_zca_model1,
+                    zca_epsilon=zca_epsilon_model1,
                     use_pairwise_loss=use_pairwise_loss_model1,
-                    use_single_target=use_single_target_model1
+                    use_single_target=use_single_target_model1,
+                    head_type=head_type_model1
                 )
                 
                 # Train Model 2 on SAME subsample indices
@@ -458,8 +550,11 @@ def subsampled_repeated_kfold_comparison(
                     epochs=epochs, lr=lr, batch_size=batch_size, device=device,
                     apply_pca=apply_pca_model2,
                     pca_n_components=pca_n_components_model2,
+                    apply_zca=apply_zca_model2,
+                    zca_epsilon=zca_epsilon_model2,
                     use_pairwise_loss=use_pairwise_loss_model2,
-                    use_single_target=use_single_target_model2
+                    use_single_target=use_single_target_model2,
+                    head_type=head_type_model2
                 )
                 
                 # Store individual scores and difference (using Kendall's Tau)
@@ -669,10 +764,16 @@ def run_comparison(
     apply_pca_to_embedding2=False,
     pca_n_components_embedding1=None,
     pca_n_components_embedding2=None,
+    apply_zca_to_embedding1=False,
+    apply_zca_to_embedding2=False,
+    zca_epsilon_embedding1=0.1,
+    zca_epsilon_embedding2=0.1,
     use_pairwise_loss_embedding1=False,
     use_pairwise_loss_embedding2=False,
     use_single_target_embedding1=False,
-    use_single_target_embedding2=False
+    use_single_target_embedding2=False,
+    head_type_embedding1='mlp',
+    head_type_embedding2='mlp'
 ):
     """
     Compare two embeddings (same corpus or cross-corpus).
@@ -703,10 +804,16 @@ def run_comparison(
         apply_pca_to_embedding2: If True, apply PCA dimensionality reduction to embedding2
         pca_n_components_embedding1: Number of PCA components for embedding1 (None = auto)
         pca_n_components_embedding2: Number of PCA components for embedding2 (None = auto)
+        apply_zca_to_embedding1: If True, apply ZCA whitening to embedding1
+        apply_zca_to_embedding2: If True, apply ZCA whitening to embedding2
+        zca_epsilon_embedding1: Epsilon for ZCA whitening regularization for embedding1
+        zca_epsilon_embedding2: Epsilon for ZCA whitening regularization for embedding2
         use_pairwise_loss_embedding1: If True, use pairwise hinge loss for embedding1
         use_pairwise_loss_embedding2: If True, use pairwise hinge loss for embedding2
         use_single_target_embedding1: If True, train embedding1 model only on valid accuracy
         use_single_target_embedding2: If True, train embedding2 model only on valid accuracy
+        head_type_embedding1: Type of head for embedding1 ('mlp', 'xgboost', or 'perceiver')
+        head_type_embedding2: Type of head for embedding2 ('mlp', 'xgboost', or 'perceiver')
     
     Returns:
         DataFrame with comparison results
@@ -745,19 +852,29 @@ def run_comparison(
         if apply_pca_to_embedding1:
             n_comp = pca_n_components_embedding1 if pca_n_components_embedding1 else 'auto'
             model1_name = f"{model1_name}_pca{n_comp}"
+        if apply_zca_to_embedding1:
+            eps = zca_epsilon_embedding1
+            model1_name = f"{model1_name}_zca{eps}"
         if use_pairwise_loss_embedding1:
             model1_name = f"{model1_name}_pairwise"
         if use_single_target_embedding1:
             model1_name = f"{model1_name}_singletarget"
+        if head_type_embedding1 != 'mlp':  # Only add suffix if not default
+            model1_name = f"{model1_name}_{head_type_embedding1}"
         
         model2_name = embedding2_name
         if apply_pca_to_embedding2:
             n_comp = pca_n_components_embedding2 if pca_n_components_embedding2 else 'auto'
             model2_name = f"{model2_name}_pca{n_comp}"
+        if apply_zca_to_embedding2:
+            eps = zca_epsilon_embedding2
+            model2_name = f"{model2_name}_zca{eps}"
         if use_pairwise_loss_embedding2:
             model2_name = f"{model2_name}_pairwise"
         if use_single_target_embedding2:
             model2_name = f"{model2_name}_singletarget"
+        if head_type_embedding2 != 'mlp':  # Only add suffix if not default
+            model2_name = f"{model2_name}_{head_type_embedding2}"
         
         corpus1 = corpus_path1
         corpus2 = corpus_path1
@@ -790,19 +907,29 @@ def run_comparison(
         if apply_pca_to_embedding1:
             n_comp = pca_n_components_embedding1 if pca_n_components_embedding1 else 'auto'
             model1_name = f"{model1_name}_pca{n_comp}"
+        if apply_zca_to_embedding1:
+            eps = zca_epsilon_embedding1
+            model1_name = f"{model1_name}_zca{eps}"
         if use_pairwise_loss_embedding1:
             model1_name = f"{model1_name}_pairwise"
         if use_single_target_embedding1:
             model1_name = f"{model1_name}_singletarget"
+        if head_type_embedding1 != 'mlp':  # Only add suffix if not default
+            model1_name = f"{model1_name}_{head_type_embedding1}"
         
         model2_name = f"{embedding2_name}_corpus2"
         if apply_pca_to_embedding2:
             n_comp = pca_n_components_embedding2 if pca_n_components_embedding2 else 'auto'
             model2_name = f"{model2_name}_pca{n_comp}"
+        if apply_zca_to_embedding2:
+            eps = zca_epsilon_embedding2
+            model2_name = f"{model2_name}_zca{eps}"
         if use_pairwise_loss_embedding2:
             model2_name = f"{model2_name}_pairwise"
         if use_single_target_embedding2:
             model2_name = f"{model2_name}_singletarget"
+        if head_type_embedding2 != 'mlp':  # Only add suffix if not default
+            model2_name = f"{model2_name}_{head_type_embedding2}"
         
         corpus1 = corpus_path1
         corpus2 = corpus_path2
@@ -855,12 +982,15 @@ def run_comparison(
     X = {model1_name: X1, model2_name: X2}
     embedding_types = [model1_name, model2_name]
     
-    # Print PCA, pairwise loss, and single target info if enabled
-    if apply_pca_to_embedding1 or apply_pca_to_embedding2 or use_pairwise_loss_embedding1 or use_pairwise_loss_embedding2 or use_single_target_embedding1 or use_single_target_embedding2:
+    # Print PCA, ZCA, pairwise loss, single target, and head type info if enabled
+    if apply_pca_to_embedding1 or apply_pca_to_embedding2 or apply_zca_to_embedding1 or apply_zca_to_embedding2 or use_pairwise_loss_embedding1 or use_pairwise_loss_embedding2 or use_single_target_embedding1 or use_single_target_embedding2 or head_type_embedding1 != 'mlp' or head_type_embedding2 != 'mlp':
         print(f"\nConfiguration:")
+        print(f"  {model1_name}: Head type = {head_type_embedding1}")
         if apply_pca_to_embedding1:
             comp1 = pca_n_components_embedding1 if pca_n_components_embedding1 else "auto"
             print(f"  {model1_name}: PCA enabled, n_components={comp1}")
+        if apply_zca_to_embedding1:
+            print(f"  {model1_name}: ZCA whitening enabled, epsilon={zca_epsilon_embedding1}")
         if use_pairwise_loss_embedding1:
             print(f"  {model1_name}: Pairwise hinge loss enabled")
         if use_single_target_embedding1:
@@ -868,9 +998,12 @@ def run_comparison(
         else:
             print(f"  {model1_name}: Dual target (loss + accuracy)")
             
+        print(f"  {model2_name}: Head type = {head_type_embedding2}")
         if apply_pca_to_embedding2:
             comp2 = pca_n_components_embedding2 if pca_n_components_embedding2 else "auto"
             print(f"  {model2_name}: PCA enabled, n_components={comp2}")
+        if apply_zca_to_embedding2:
+            print(f"  {model2_name}: ZCA whitening enabled, epsilon={zca_epsilon_embedding2}")
         if use_pairwise_loss_embedding2:
             print(f"  {model2_name}: Pairwise hinge loss enabled")
         if use_single_target_embedding2:
@@ -895,10 +1028,16 @@ def run_comparison(
         apply_pca_model2=apply_pca_to_embedding2,
         pca_n_components_model1=pca_n_components_embedding1,
         pca_n_components_model2=pca_n_components_embedding2,
+        apply_zca_model1=apply_zca_to_embedding1,
+        apply_zca_model2=apply_zca_to_embedding2,
+        zca_epsilon_model1=zca_epsilon_embedding1,
+        zca_epsilon_model2=zca_epsilon_embedding2,
         use_pairwise_loss_model1=use_pairwise_loss_embedding1,
         use_pairwise_loss_model2=use_pairwise_loss_embedding2,
         use_single_target_model1=use_single_target_embedding1,
-        use_single_target_model2=use_single_target_embedding2
+        use_single_target_model2=use_single_target_embedding2,
+        head_type_model1=head_type_embedding1,
+        head_type_model2=head_type_embedding2
     )
     
     # Add metadata
