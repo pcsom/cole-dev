@@ -106,7 +106,7 @@ def main():
     remaining_corpus = list(range(len(df_corpus)))
     remaining_onnx = list(range(len(df_onnx)))
     
-    precisions = [0.00001, 0.0001, 0.001, 0.01, 0.1]
+    precisions = [0.00001, 0.0001, 0.001]
     
     for precision in precisions:
         if len(remaining_corpus) == 0 or len(remaining_onnx) == 0:
