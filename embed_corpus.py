@@ -36,7 +36,7 @@ def mean_pooling(model_output, attention_mask):
     sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
     return sum_embeddings / sum_mask
 
-def get_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=2048):
+def get_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=2048, multi_layer_embeddings=False):
     """
     Extract embeddings for a list of texts using mean pooling.
     
@@ -86,55 +86,81 @@ def get_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=20
             # ModernBERT (encoder) does not have this arg and will error if it is passed.
             if getattr(model.config, 'use_cache', False):
                 model_inputs['use_cache'] = False
-            
-            # Get model output
-            outputs = model(**model_inputs)
-            
-            # Mean pooling
-            embeddings = mean_pooling(outputs, attention_mask)
-            
-            # Move to CPU and convert to numpy
-            all_embeddings.append(embeddings.cpu().numpy())
+
+            # Run inference
+            # If multi_layer_embeddings arg is True, we request hidden states
+            if multi_layer_embeddings:
+                outputs = model(**model_inputs, output_hidden_states=True)
+                
+                # Extract hidden states tuple: (layer_0, layer_1, ..., layer_N)
+                # Select every 4th layer, starting from the LAST one and going backwards
+                # e.g., indices: [-1, -5, -9, ...]
+                # We reverse the list at the end so they are in order of depth (shallow -> deep)
+                all_layers = outputs.hidden_states
+                selected_indices = range(len(all_layers) - 1, -1, -4)
+                selected_layers = [all_layers[i] for i in selected_indices][::-1]
+                
+                layer_vectors = []
+                input_mask_expanded = attention_mask.unsqueeze(-1).float()
+                sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+                for layer_tensor in selected_layers:
+                    # layer_tensor shape: (Batch, Seq_Len, Hidden_Dim)
+                    # Expand mask to match hidden dim: (Batch, Seq_Len, Hidden_Dim)
+                    curr_mask = input_mask_expanded.expand(layer_tensor.size())
+                    
+                    # Mean Pool tokens for this specific layer
+                    sum_embeddings = torch.sum(layer_tensor * curr_mask, 1)
+                    pooled_layer = sum_embeddings / sum_mask # (Batch, Hidden_Dim)
+                    layer_vectors.append(pooled_layer.cpu().numpy())
+                
+                # Stack to get (Batch, Num_Selected_Layers, Hidden_Dim)
+                # We transpose locally to align with the list structure -> numpy stack
+                batch_result = np.stack(layer_vectors, axis=1) # Axis 1 is layers
+                all_embeddings.append(batch_result)
+
+            else:
+                # Get model output
+                outputs = model(**model_inputs)
+                
+                # Mean pooling
+                embeddings = mean_pooling(outputs, attention_mask)
+                
+                # Move to CPU and convert to numpy
+                all_embeddings.append(embeddings.cpu().numpy())
     
     return np.vstack(all_embeddings)
 
-def get_echo_embeddings(texts, model, tokenizer, device, batch_size=8, max_length=2048):
+def get_echo_embeddings(texts, model, tokenizer, device, batch_size=8, max_length=2048, pooling='last_token'):
     """
-    Extract Echo Embeddings (Springer et al., 2024).
-    Input: [x, x] (text repeated twice with \n\n separator)
-    Pooling: Mean pooling over the SECOND occurrence only.
-    
-    This method is designed for causal decoder models (CodeLlama, Qwen, etc.)
-    and may not be appropriate for encoder-only models (BERT, ModernBERT).
+    Extract Echo Embeddings with corrected pooling logic.
     
     Args:
-        texts: List of text strings
-        model: Transformer model
-        tokenizer: Tokenizer
-        device: Device to run on
-        batch_size: Batch size for processing (smaller due to doubled sequence length)
-        max_length: Maximum sequence length
-    
-    Returns:
-        numpy array of embeddings [num_texts, embedding_dim]
+        pooling: 'last_token' (Recommended for Llama/Mistral) or 'second_half_mean'.
     """
     all_embeddings = []
     
-    # Check model type
+    # Encoder check
     is_encoder = model.config.is_encoder_decoder if hasattr(model.config, 'is_encoder_decoder') else False
     if is_encoder or 'bert' in model.config.model_type.lower():
-        print("WARNING: Echo embeddings are designed for causal decoder models (CodeLlama/Qwen).")
-        print("         Using on encoder models (BERT/ModernBERT) is experimental and unproven.")
-    
+        print("WARNING: Echo embeddings are for causal decoders (Llama, Qwen, etc).")
+
     model.eval()
+    
+    # Ensure tokenizer pads on the RIGHT for easy indexing, though Llama usually likes Left.
+    # For embedding extraction, Right padding makes index calculation easier.
+    tokenizer.padding_side = "right" 
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     with torch.no_grad():
-        for i in tqdm(range(0, len(texts), batch_size), desc="Extracting Echo Embeddings"):
+        for i in tqdm(range(0, len(texts), batch_size), desc=f"Echo Embeddings ({pooling})"):
             batch_texts = texts[i:i+batch_size]
             
-            # Create echo strings: text + "\n\n" + text
-            echo_texts = [t + "\n\n" + t for t in batch_texts]
+            # 1. Construct Echo: [x, x]
+            # We use a space + \n\n + space to prevent accidental BPE merges across the boundary
+            echo_texts = [f"{t} \n\n {t}" for t in batch_texts]
             
-            # Tokenize the full echo strings
             encoded = tokenizer(
                 echo_texts,
                 padding=True,
@@ -146,52 +172,52 @@ def get_echo_embeddings(texts, model, tokenizer, device, batch_size=8, max_lengt
             input_ids = encoded['input_ids'].to(device)
             attention_mask = encoded['attention_mask'].to(device)
             
-            # Create pooling mask that selects only the second repetition
-            pooling_mask = torch.zeros_like(attention_mask)
-            
-            for b_idx, text in enumerate(batch_texts):
-                # Tokenize just the first part to find the boundary
-                first_part_tokens = tokenizer(text + "\n\n", add_special_tokens=False)['input_ids']
-                first_part_len = len(first_part_tokens)
-                
-                # Get total valid length (excluding padding)
-                total_len = attention_mask[b_idx].sum().item()
-                
-                # The echo part is from first_part_len to end
-                start_idx = min(first_part_len, total_len - 1)
-                end_idx = total_len
-                
-                # Set mask to 1 only for the second occurrence
-                pooling_mask[b_idx, start_idx:end_idx] = 1
-            
-            # Prepare model inputs
-            model_inputs = {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask
-            }
-            
-            if getattr(model.config, 'use_cache', False):
-                model_inputs['use_cache'] = False
-            
             # Forward pass
-            outputs = model(**model_inputs)
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
             
-            # Get last hidden state
+            # Use last hidden state
             if hasattr(outputs, 'last_hidden_state'):
-                token_embeddings = outputs.last_hidden_state
+                hidden_states = outputs.last_hidden_state
             else:
-                token_embeddings = outputs[0]
+                hidden_states = outputs[0]
             
-            # Weighted mean pooling using the POOLING MASK (not attention mask)
-            input_mask_expanded = pooling_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            # --- POOLING LOGIC ---
             
-            sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
-            sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            # Find the index of the last valid token for each sequence
+            # (batch_size,)
+            sequence_lengths = attention_mask.sum(dim=1) - 1
             
-            embeddings = sum_embeddings / sum_mask
+            if pooling == 'last_token':
+                # Gather the vector corresponding to the last real token
+                # hidden_states: [batch, seq_len, dim]
+                # indices: [batch, 1, dim]
+                indices = sequence_lengths.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))
+                # Gather along sequence dimension (dim 1)
+                embeddings = torch.gather(hidden_states, 1, indices).squeeze(1)
+                
+            elif pooling == 'second_half_mean':
+                # Safe approximation: The second half is the latter 50% of the valid tokens.
+                # This avoids the Tokenizer mismatch bug.
+                batch_embeddings = []
+                for b_idx in range(len(batch_texts)):
+                    valid_len = sequence_lengths[b_idx].item() + 1
+                    
+                    # Approximated start of the second repetition
+                    # (Sequence is A + sep + A, so A is roughly half)
+                    half_point = valid_len // 2 
+                    
+                    # Take slice from half_point to end
+                    # shape: (seq_slice, dim)
+                    second_half_vecs = hidden_states[b_idx, half_point:valid_len, :]
+                    
+                    # Mean pool
+                    pooled = torch.mean(second_half_vecs, dim=0)
+                    batch_embeddings.append(pooled)
+                
+                embeddings = torch.stack(batch_embeddings)
+
+            all_embeddings.append(embeddings.cpu().float().numpy())
             
-            all_embeddings.append(embeddings.cpu().numpy())
-    
     return np.vstack(all_embeddings)
 
 def get_embeddings_sentence_transformers(texts, model, batch_size=16):
@@ -217,7 +243,7 @@ def get_embeddings_sentence_transformers(texts, model, batch_size=16):
 
 def embed_with_model(df, model_name, model_display_name, device='cuda', force=None, pytorch_only=False, 
                      onnx_only=False, use_sentence_transformers=False, use_quantization=True, use_echo_embeddings=False,
-                     pytorch_context_mode=None, max_length=2048):
+                     pytorch_context_mode=None, max_length=2048, multi_layer_embeddings=False):
     """
     Add embeddings from a specific model to the dataframe.
     
@@ -235,6 +261,8 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
         pytorch_context_mode: None (default), "network" (add full Network code), or "comment" (add docstring).
                              Affects pytorch_code embedding by appending context information.
+        max_length: Maximum sequence length for tokenization
+        multi_layer_embeddings: If True, extract embeddings from multiple layers
     
     Returns:
         DataFrame with added embedding columns
@@ -263,12 +291,14 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
     # Build expected column names based on context mode
     expected_cols = []
     for ct in code_types:
-        # Build suffix based on echo and quantization settings
+        # Build suffix based on echo, quantization, and multi-layer settings
         suffix_parts = []
         if use_echo_embeddings:
             suffix_parts.append('echo')
         if not use_quantization:
             suffix_parts.append('noquant')
+        if multi_layer_embeddings:
+            suffix_parts.append('multilayer')
         suffix = '_' + '_'.join(suffix_parts) if suffix_parts else ''
         
         # Apply context mode naming for any pytorch column
@@ -395,7 +425,7 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         elif use_echo_embeddings:
             embeddings = get_echo_embeddings(texts, model, tokenizer, device)
         else:
-            embeddings = get_embeddings(texts, model, tokenizer, device, max_length=max_length)
+            embeddings = get_embeddings(texts, model, tokenizer, device, max_length=max_length, multi_layer_embeddings=multi_layer_embeddings)
         
         # Add to dataframe as a column (store as list for each row)
         column_name = expected_cols[i]
@@ -468,7 +498,8 @@ def embed_corpus(
     model_names=None,
     use_echo_embeddings=False,
     use_quantization=True,
-    max_length=2048
+    max_length=2048,
+    multi_layer_embeddings=False
 ):
     """
     Embed code representations in the corpus using multiple LLMs.
@@ -529,7 +560,8 @@ def embed_corpus(
             use_sentence_transformers=model_config.get('sentence_transformer', False),
             use_quantization=use_quantization,
             use_echo_embeddings=use_echo_embeddings,
-            max_length=max_length
+            max_length=max_length,
+            multi_layer_embeddings=multi_layer_embeddings
         )
     
     # Save results
@@ -570,7 +602,8 @@ def add_embeddings_to_corpus(
     use_echo_embeddings=False,
     use_quantization=True,
     pytorch_context_mode=None,
-    max_length=2048
+    max_length=2048,
+    multi_layer_embeddings=False
 ):
     """
     Add embeddings from a new model to an existing corpus.
@@ -649,12 +682,14 @@ def add_embeddings_to_corpus(
     
     expected_embedding_cols = []
     for ct in code_types:
-        # Build suffix based on echo and quantization settings
+        # Build suffix based on echo, quantization, and multi-layer settings
         suffix_parts = []
         if use_echo_embeddings:
             suffix_parts.append('echo')
         if not use_quantization:
             suffix_parts.append('noquant')
+        if multi_layer_embeddings:
+            suffix_parts.append('multilayer')
         suffix = '_' + '_'.join(suffix_parts) if suffix_parts else ''
         
         # Apply context mode naming for any pytorch column
@@ -704,7 +739,8 @@ def add_embeddings_to_corpus(
         onnx_only=onnx_only,
         use_echo_embeddings=use_echo_embeddings,
         pytorch_context_mode=pytorch_context_mode,
-        max_length=max_length
+        max_length=max_length,
+        multi_layer_embeddings=multi_layer_embeddings
     )
     
     # The new columns should match the expected_embedding_cols we computed earlier
