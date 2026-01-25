@@ -19,7 +19,8 @@ import torch.nn as nn
 import torch.optim as optim
 from sklearn.model_selection import StratifiedKFold
 from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
+from softpca import SoftPCA
+import umap
 from tqdm import tqdm
 import scipy.stats as stats
 from scipy.stats import kendalltau
@@ -95,7 +96,7 @@ class FlanPairwiseHingeLoss(nn.Module):
 def train_model_on_subsample(
     X_train_pool, y_train_pool, X_test, y_test,
     sample_size, random_state, epochs=100, lr=0.001, batch_size=16, device='cuda', patience=20,
-    apply_pca=False, pca_n_components=None, apply_zca=False, zca_epsilon=0.1, use_pairwise_loss=False, use_single_target=False,
+    dim_reduction_method=None, dim_reduction_components=None, pca_whitening_epsilon=None, apply_zca=False, zca_epsilon=0.1, use_pairwise_loss=False, use_single_target=False,
     head_type='mlp'
 ):
     """
@@ -118,14 +119,15 @@ def train_model_on_subsample(
         batch_size: Batch size
         device: Device to use
         patience: (Unused, kept for API compatibility)
-        apply_pca: If True, apply PCA dimensionality reduction
-        pca_n_components: Number of PCA components (if None, uses min(n_samples, n_features))
+        dim_reduction_method: Dimensionality reduction method (None, 'softpca', or 'umap')
+        dim_reduction_components: Number of components for dimensionality reduction
+        pca_whitening_epsilon: Epsilon for SoftPCA whitening (only used if dim_reduction_method='softpca')
         use_pairwise_loss: If True, use pairwise hinge loss instead of MSE
         use_single_target: If True, train only on valid accuracy (single target) instead of both loss and accuracy
         head_type: Type of head to use ('mlp', 'xgboost', or 'perceiver')
     
     Preprocessing:
-        - Features (embeddings): NOT scaled (sensitive distributions), but PCA can be applied
+        - Features (embeddings): NOT scaled (sensitive distributions), but SoftPCA can be applied
         - Targets (accuracy/loss): Scaled to mean=0, std=1 for balanced gradients
     
     Returns:
@@ -191,10 +193,10 @@ def train_model_on_subsample(
             X_train = zca.fit_transform(X_train)
             X_test = zca.transform(X_test)
     
-    # Apply PCA if requested (before scaling targets)
-    if apply_pca:
+    # Apply dimensionality reduction if requested (before scaling targets)
+    if dim_reduction_method in ['softpca', 'umap']:
         if is_multilayer:
-            # --- SHARED-BASIS PCA FOR MULTI-LAYER ---
+            # --- SHARED-BASIS DIMENSIONALITY REDUCTION FOR MULTI-LAYER ---
             N_train, L_train, D_dim = X_train.shape
             N_test, L_test, _ = X_test.shape
             
@@ -204,32 +206,51 @@ def train_model_on_subsample(
             X_test_flat = X_test.reshape(-1, D_dim)   # (N*L, 4096)
             
             # 2. Determine components based on effective sample size or explicit arg
-            if pca_n_components is None:
-                raise ValueError("pca_n_components must be specified if apply_pca is True")
-            else:
-                n_components = min(pca_n_components, X_train_flat.shape[0], X_train_flat.shape[1])
+            if dim_reduction_components is None:
+                raise ValueError(f"dim_reduction_components must be specified if dim_reduction_method is '{dim_reduction_method}'")
             
-            # 3. Fit PCA on flattened training data
-            pca = PCA(n_components=n_components, random_state=random_state)
-            X_train_flat = pca.fit_transform(X_train_flat)
-            X_test_flat = pca.transform(X_test_flat)
+            # 3. Fit dimensionality reduction on flattened training data
+            if dim_reduction_method == 'softpca':
+                n_components = min(dim_reduction_components, X_train_flat.shape[0])
+                reducer = SoftPCA(n_components=n_components, epsilon=pca_whitening_epsilon, random_state=random_state)
+                X_train_flat = reducer.fit_transform(X_train_flat)
+                X_test_flat = reducer.transform(X_test_flat)
+            elif dim_reduction_method == 'umap':
+                n_components = dim_reduction_components
+                if n_components >= sample_size:
+                    reducer = umap.UMAP(n_components=n_components, init='random', random_state=random_state, n_jobs=-1)
+                else:
+                    reducer = umap.UMAP(n_components=n_components, random_state=random_state, n_jobs=-1)
+                X_train_flat = reducer.fit_transform(X_train_flat)
+                X_test_flat = reducer.transform(X_test_flat)
             
             # 4. Reshape back to 3D
             # New shape: (N, L, n_components)
             X_train = X_train_flat.reshape(N_train, L_train, -1)
             X_test = X_test_flat.reshape(N_test, L_test, -1)
             
-            print(f"  Multi-layer PCA: Reduced {D_dim} -> {X_train.shape[2]} dims (Shared Basis)")
+            print(f"  Multi-layer {dim_reduction_method.upper()}: Reduced {D_dim} -> {X_train.shape[2]} dims (Shared Basis)")
         else:
             # Determine number of components
-            if pca_n_components is None:
-                raise ValueError("pca_n_components must be specified if apply_pca is True")
-            n_components = min(pca_n_components, sample_size, X_train.shape[1])
+            if dim_reduction_components is None:
+                raise ValueError(f"dim_reduction_components must be specified if dim_reduction_method is '{dim_reduction_method}'")
             
-            # Fit PCA on training subsample, transform both train and test
-            pca = PCA(n_components=n_components, random_state=random_state)
-            X_train = pca.fit_transform(X_train)
-            X_test = pca.transform(X_test)
+            # Fit dimensionality reduction on training subsample, transform both train and test
+            if dim_reduction_method == 'softpca':
+                n_components = min(dim_reduction_components, sample_size)
+
+                reducer = SoftPCA(n_components=n_components, epsilon=pca_whitening_epsilon, random_state=random_state)
+                X_train = reducer.fit_transform(X_train)
+                X_test = reducer.transform(X_test)
+            elif dim_reduction_method == 'umap':
+                # n_components = dim_reduction_components
+                n_components = min(dim_reduction_components, sample_size-2)
+                if n_components >= sample_size:
+                    reducer = umap.UMAP(n_components=n_components, init='random', random_state=random_state, n_jobs=-1)
+                else:
+                    reducer = umap.UMAP(n_components=n_components, random_state=random_state, n_jobs=-1)
+                X_train = reducer.fit_transform(X_train)
+                X_test = reducer.transform(X_test)
     
     # Scale TARGETS (not features - embeddings have sensitive distributions)
     target_scaler = StandardScaler()
@@ -326,43 +347,43 @@ def train_model_on_subsample(
             test_pred = target_scaler.inverse_transform(test_pred_scaled)
             test_true = y_test
         
-        # Calculate metrics (for accuracy prediction)
-        if use_single_target:
-            acc_pred = test_pred[:, 0]  # Single column output
-            acc_true = test_true[:, 0]  # Single column target
-        else:
-            acc_pred = test_pred[:, 1]  # Second column (accuracy)
-            acc_true = test_true[:, 1]
-        
-        # 1. Check for NaNs in output (Gradient explosion)
-        if np.any(np.isnan(acc_pred)):
-            print(f"  WARNING: NaNs in prediction. Assigning Tau=0.0.")
-            return { 'kendall_tau': 0.0, 'mse': 999.0, 'n_train': sample_size, 'n_test': len(X_test) }
-        
-        pred_variance = np.var(acc_pred)
-        true_variance = np.var(acc_true)
+    # Calculate metrics (for accuracy prediction)
+    if use_single_target:
+        acc_pred = test_pred[:, 0]  # Single column output
+        acc_true = test_true[:, 0]  # Single column target
+    else:
+        acc_pred = test_pred[:, 1]  # Second column (accuracy)
+        acc_true = test_true[:, 1]
+    
+    # 1. Check for NaNs in output (Gradient explosion)
+    if np.any(np.isnan(acc_pred)):
+        print(f"  WARNING: NaNs in prediction. Assigning Tau=0.0.")
+        return { 'kendall_tau': 0.0, 'mse': 999.0, 'n_train': sample_size, 'n_test': len(X_test) }
+    
+    pred_variance = np.var(acc_pred)
+    true_variance = np.var(acc_true)
 
-        # 2. Check for Soft Collapse (Variance is tiny but not zero)
-        pred_variance = np.var(acc_pred)
-        if pred_variance < 1e-7:  # Changed from == 0 to epsilon threshold
-            print(f"  WARNING: Soft model collapse (Var={pred_variance:.8f}). Assigning Tau=0.0.") 
-            ktau = 0.0
-        
-        # Kendall's Tau - PRIMARY METRIC for NAS
-        # Measures rank correlation: does the surrogate order architectures correctly?
-        # More robust than MSE for low-data regimes and non-linear relationships
-        try:
-            ktau, ktau_pvalue = kendalltau(acc_true, acc_pred)
-        except Exception:
-            ktau = np.nan # Catch internal scipy errors
-        
-        # 3. Handle NaN return from kendalltau (occurs with ties/constants)
-        if np.isnan(ktau):
-            print(f"  WARNING: kendalltau returned NaN (likely due to ties). Assigning Tau=0.0.")
-            ktau = 0.0      # Penalize the model
-        
-        # MSE (mean squared error)
-        mse = np.mean((acc_true - acc_pred) ** 2)
+    # 2. Check for Soft Collapse (Variance is tiny but not zero)
+    pred_variance = np.var(acc_pred)
+    if pred_variance < 1e-7:  # Changed from == 0 to epsilon threshold
+        print(f"  WARNING: Soft model collapse (Var={pred_variance:.8f}). Assigning Tau=0.0.") 
+        ktau = 0.0
+    
+    # Kendall's Tau - PRIMARY METRIC for NAS
+    # Measures rank correlation: does the surrogate order architectures correctly?
+    # More robust than MSE for low-data regimes and non-linear relationships
+    try:
+        ktau, ktau_pvalue = kendalltau(acc_true, acc_pred)
+    except Exception:
+        ktau = np.nan # Catch internal scipy errors
+    
+    # 3. Handle NaN return from kendalltau (occurs with ties/constants)
+    if np.isnan(ktau):
+        print(f"  WARNING: kendalltau returned NaN (likely due to ties). Assigning Tau=0.0.")
+        ktau = 0.0      # Penalize the model
+    
+    # MSE (mean squared error)
+    mse = np.mean((acc_true - acc_pred) ** 2)
     
     return {
         'kendall_tau': ktau,  # Primary metric
@@ -389,10 +410,12 @@ def subsampled_repeated_kfold_comparison(
     pairs_to_compute=None,
     trial_data_dict=None,
     existing_trials_dict=None,
-    apply_pca_model1=False,
-    apply_pca_model2=False,
-    pca_n_components_model1=None,
-    pca_n_components_model2=None,
+    dim_reduction_method_model1=None,
+    dim_reduction_method_model2=None,
+    dim_reduction_components_model1=None,
+    dim_reduction_components_model2=None,
+    pca_whitening_epsilon_model1=None,
+    pca_whitening_epsilon_model2=None,
     apply_zca_model1=False,
     apply_zca_model2=False,
     zca_epsilon_model1=0.1,
@@ -423,10 +446,12 @@ def subsampled_repeated_kfold_comparison(
         random_state: Base random seed
         existing_results: DataFrame of existing results (optional)
         pairs_to_compute: List of (sample_size, existing_trials, needed_trials) tuples
-        apply_pca_model1: If True, apply PCA to model 1 embeddings
-        apply_pca_model2: If True, apply PCA to model 2 embeddings
-        pca_n_components_model1: Number of PCA components for model 1 (None = auto)
-        pca_n_components_model2: Number of PCA components for model 2 (None = auto)
+        dim_reduction_method_model1: Dimensionality reduction for model 1 (None, 'softpca', or 'umap')
+        dim_reduction_method_model2: Dimensionality reduction for model 2 (None, 'softpca', or 'umap')
+        dim_reduction_components_model1: Number of components for model 1
+        dim_reduction_components_model2: Number of components for model 2
+        pca_whitening_epsilon_model1: Epsilon for SoftPCA whitening for model 1
+        pca_whitening_epsilon_model2: Epsilon for SoftPCA whitening for model 2
         apply_zca_model1: If True, apply ZCA whitening to model 1 embeddings
         apply_zca_model2: If True, apply ZCA whitening to model 2 embeddings
         zca_epsilon_model1: Epsilon for ZCA whitening regularization for model 1
@@ -532,8 +557,9 @@ def subsampled_repeated_kfold_comparison(
                     sample_size=min(sample_size, len(X1_pool)),
                     random_state=seed1,
                     epochs=epochs, lr=lr, batch_size=batch_size, device=device,
-                    apply_pca=apply_pca_model1,
-                    pca_n_components=pca_n_components_model1,
+                    dim_reduction_method=dim_reduction_method_model1,
+                    dim_reduction_components=dim_reduction_components_model1,
+                    pca_whitening_epsilon=pca_whitening_epsilon_model1,
                     apply_zca=apply_zca_model1,
                     zca_epsilon=zca_epsilon_model1,
                     use_pairwise_loss=use_pairwise_loss_model1,
@@ -548,8 +574,9 @@ def subsampled_repeated_kfold_comparison(
                     sample_size=min(sample_size, len(X2_pool)),
                     random_state=seed2,
                     epochs=epochs, lr=lr, batch_size=batch_size, device=device,
-                    apply_pca=apply_pca_model2,
-                    pca_n_components=pca_n_components_model2,
+                    dim_reduction_method=dim_reduction_method_model2,
+                    dim_reduction_components=dim_reduction_components_model2,
+                    pca_whitening_epsilon=pca_whitening_epsilon_model2,
                     apply_zca=apply_zca_model2,
                     zca_epsilon=zca_epsilon_model2,
                     use_pairwise_loss=use_pairwise_loss_model2,
@@ -760,10 +787,12 @@ def run_comparison(
     per_embedding_output_dir=None,
     device='cuda',
     force=False,
-    apply_pca_to_embedding1=False,
-    apply_pca_to_embedding2=False,
-    pca_n_components_embedding1=None,
-    pca_n_components_embedding2=None,
+    dim_reduction_method_embedding1=None,
+    dim_reduction_method_embedding2=None,
+    dim_reduction_components_embedding1=None,
+    dim_reduction_components_embedding2=None,
+    pca_whitening_epsilon_embedding1=None,
+    pca_whitening_epsilon_embedding2=None,
     apply_zca_to_embedding1=False,
     apply_zca_to_embedding2=False,
     zca_epsilon_embedding1=0.1,
@@ -795,15 +824,17 @@ def run_comparison(
         sample_sizes: List of training sizes
         n_folds: Number of CV folds
         n_repeats: Number of CV repeats
-        benchmark_type: 'nasbench' or 'jahs'
+        benchmark_type: 'nasbench' or 'jahs' or 'einspace'
         comparison_output_path: Path to global comparison CSV (Type 2)
         per_embedding_output_dir: Directory for per-embedding CSVs (Type 1)
         device: Device to use
         force: If True, ignore existing trials and recompute all
-        apply_pca_to_embedding1: If True, apply PCA dimensionality reduction to embedding1
-        apply_pca_to_embedding2: If True, apply PCA dimensionality reduction to embedding2
-        pca_n_components_embedding1: Number of PCA components for embedding1 (None = auto)
-        pca_n_components_embedding2: Number of PCA components for embedding2 (None = auto)
+        dim_reduction_method_embedding1: Dimensionality reduction for embedding1 (None, 'softpca', or 'umap')
+        dim_reduction_method_embedding2: Dimensionality reduction for embedding2 (None, 'softpca', or 'umap')
+        dim_reduction_components_embedding1: Number of components for embedding1
+        dim_reduction_components_embedding2: Number of components for embedding2
+        pca_whitening_epsilon_embedding1: Epsilon for SoftPCA whitening for embedding1
+        pca_whitening_epsilon_embedding2: Epsilon for SoftPCA whitening for embedding2
         apply_zca_to_embedding1: If True, apply ZCA whitening to embedding1
         apply_zca_to_embedding2: If True, apply ZCA whitening to embedding2
         zca_epsilon_embedding1: Epsilon for ZCA whitening regularization for embedding1
@@ -849,9 +880,12 @@ def run_comparison(
         # Create unique model names with configuration suffixes
         # This ensures different training configurations are distinguished even for same embedding
         model1_name = embedding1_name
-        if apply_pca_to_embedding1:
-            n_comp = pca_n_components_embedding1 if pca_n_components_embedding1 else 'auto'
-            model1_name = f"{model1_name}_pca{n_comp}"
+        if dim_reduction_method_embedding1:
+            n_comp = dim_reduction_components_embedding1 if dim_reduction_components_embedding1 else 'auto'
+            model1_name = f"{model1_name}_{dim_reduction_method_embedding1}{n_comp}"
+            # Add whitening epsilon if using softpca
+            if dim_reduction_method_embedding1 == 'softpca' and pca_whitening_epsilon_embedding1 is not None:
+                model1_name = f"{model1_name}_eps{pca_whitening_epsilon_embedding1}"
         if apply_zca_to_embedding1:
             eps = zca_epsilon_embedding1
             model1_name = f"{model1_name}_zca{eps}"
@@ -863,9 +897,12 @@ def run_comparison(
             model1_name = f"{model1_name}_{head_type_embedding1}"
         
         model2_name = embedding2_name
-        if apply_pca_to_embedding2:
-            n_comp = pca_n_components_embedding2 if pca_n_components_embedding2 else 'auto'
-            model2_name = f"{model2_name}_pca{n_comp}"
+        if dim_reduction_method_embedding2:
+            n_comp = dim_reduction_components_embedding2 if dim_reduction_components_embedding2 else 'auto'
+            model2_name = f"{model2_name}_{dim_reduction_method_embedding2}{n_comp}"
+            # Add whitening epsilon if using softpca
+            if dim_reduction_method_embedding2 == 'softpca' and pca_whitening_epsilon_embedding2 is not None:
+                model2_name = f"{model2_name}_eps{pca_whitening_epsilon_embedding2}"
         if apply_zca_to_embedding2:
             eps = zca_epsilon_embedding2
             model2_name = f"{model2_name}_zca{eps}"
@@ -904,9 +941,12 @@ def run_comparison(
         
         # Create unique model names with corpus and configuration suffixes
         model1_name = f"{embedding1_name}_corpus1"
-        if apply_pca_to_embedding1:
-            n_comp = pca_n_components_embedding1 if pca_n_components_embedding1 else 'auto'
-            model1_name = f"{model1_name}_pca{n_comp}"
+        if dim_reduction_method_embedding1:
+            n_comp = dim_reduction_components_embedding1 if dim_reduction_components_embedding1 else 'auto'
+            model1_name = f"{model1_name}_{dim_reduction_method_embedding1}{n_comp}"
+            # Add whitening epsilon if using softpca
+            if dim_reduction_method_embedding1 == 'softpca' and pca_whitening_epsilon_embedding1 is not None:
+                model1_name = f"{model1_name}_eps{pca_whitening_epsilon_embedding1}"
         if apply_zca_to_embedding1:
             eps = zca_epsilon_embedding1
             model1_name = f"{model1_name}_zca{eps}"
@@ -918,9 +958,12 @@ def run_comparison(
             model1_name = f"{model1_name}_{head_type_embedding1}"
         
         model2_name = f"{embedding2_name}_corpus2"
-        if apply_pca_to_embedding2:
-            n_comp = pca_n_components_embedding2 if pca_n_components_embedding2 else 'auto'
-            model2_name = f"{model2_name}_pca{n_comp}"
+        if dim_reduction_method_embedding2:
+            n_comp = dim_reduction_components_embedding2 if dim_reduction_components_embedding2 else 'auto'
+            model2_name = f"{model2_name}_{dim_reduction_method_embedding2}{n_comp}"
+            # Add whitening epsilon if using softpca
+            if dim_reduction_method_embedding2 == 'softpca' and pca_whitening_epsilon_embedding2 is not None:
+                model2_name = f"{model2_name}_eps{pca_whitening_epsilon_embedding2}"
         if apply_zca_to_embedding2:
             eps = zca_epsilon_embedding2
             model2_name = f"{model2_name}_zca{eps}"
@@ -940,6 +983,8 @@ def run_comparison(
         y = df[['cifar10-valid_valid_loss', 'cifar10-valid_valid_accuracy']].values.astype(np.float32)
     elif benchmark_type == 'jahs':
         y = df[['test_acc', 'valid_acc']].values.astype(np.float32)
+    elif benchmark_type == 'einspace':
+        y = df[['accuracy', 'accuracy']].values.astype(np.float32)
     else:
         raise ValueError(f"Unknown benchmark_type: {benchmark_type}")
     
@@ -951,27 +996,19 @@ def run_comparison(
     print(f"{'='*80}\n")
     
     # Load existing trials from Type 1 CSVs
-    # NOTE: Type 1 CSVs only contain raw embeddings (no PCA, no pairwise loss)
-    # Only load existing trials if model name matches original embedding name (no transformations)
+    # Load using full model name (with config suffixes like _pca64, _zca0.1, etc.)
     existing_trials_dict = {}  # Existing trials loaded from disk
     new_trials_dict = {}  # New trials to be computed and saved
     if not force and per_embedding_output_dir:
         print(f"Loading existing trials from Type 1 CSVs...")
         
-        # Only load if model name matches original (no config suffixes = no transformations)
-        if model1_name == embedding1_name:
-            existing_trials_dict[model1_name] = load_existing_trials(
-                per_embedding_output_dir, embedding1_name, corpus1_name
-            )
-        else:
-            existing_trials_dict[model1_name] = {}  # No existing trials for transformed configs
-            
-        if model2_name == embedding2_name:
-            existing_trials_dict[model2_name] = load_existing_trials(
-                per_embedding_output_dir, embedding2_name, corpus2_name
-            )
-        else:
-            existing_trials_dict[model2_name] = {}  # No existing trials for transformed configs
+        # Load using full model name (includes all config suffixes)
+        existing_trials_dict[model1_name] = load_existing_trials(
+            per_embedding_output_dir, model1_name, corpus1_name
+        )
+        existing_trials_dict[model2_name] = load_existing_trials(
+            per_embedding_output_dir, model2_name, corpus2_name
+        )
         
         total_m1 = sum(len(trials) for trials in existing_trials_dict[model1_name].values())
         total_m2 = sum(len(trials) for trials in existing_trials_dict[model2_name].values())
@@ -982,13 +1019,13 @@ def run_comparison(
     X = {model1_name: X1, model2_name: X2}
     embedding_types = [model1_name, model2_name]
     
-    # Print PCA, ZCA, pairwise loss, single target, and head type info if enabled
-    if apply_pca_to_embedding1 or apply_pca_to_embedding2 or apply_zca_to_embedding1 or apply_zca_to_embedding2 or use_pairwise_loss_embedding1 or use_pairwise_loss_embedding2 or use_single_target_embedding1 or use_single_target_embedding2 or head_type_embedding1 != 'mlp' or head_type_embedding2 != 'mlp':
+    # Print dimensionality reduction, ZCA, pairwise loss, single target, and head type info if enabled
+    if dim_reduction_method_embedding1 or dim_reduction_method_embedding2 or apply_zca_to_embedding1 or apply_zca_to_embedding2 or use_pairwise_loss_embedding1 or use_pairwise_loss_embedding2 or use_single_target_embedding1 or use_single_target_embedding2 or head_type_embedding1 != 'mlp' or head_type_embedding2 != 'mlp':
         print(f"\nConfiguration:")
         print(f"  {model1_name}: Head type = {head_type_embedding1}")
-        if apply_pca_to_embedding1:
-            comp1 = pca_n_components_embedding1 if pca_n_components_embedding1 else "auto"
-            print(f"  {model1_name}: PCA enabled, n_components={comp1}")
+        if dim_reduction_method_embedding1:
+            comp1 = dim_reduction_components_embedding1 if dim_reduction_components_embedding1 else "auto"
+            print(f"  {model1_name}: {dim_reduction_method_embedding1.upper()} enabled, n_components={comp1}")
         if apply_zca_to_embedding1:
             print(f"  {model1_name}: ZCA whitening enabled, epsilon={zca_epsilon_embedding1}")
         if use_pairwise_loss_embedding1:
@@ -999,9 +1036,9 @@ def run_comparison(
             print(f"  {model1_name}: Dual target (loss + accuracy)")
             
         print(f"  {model2_name}: Head type = {head_type_embedding2}")
-        if apply_pca_to_embedding2:
-            comp2 = pca_n_components_embedding2 if pca_n_components_embedding2 else "auto"
-            print(f"  {model2_name}: PCA enabled, n_components={comp2}")
+        if dim_reduction_method_embedding2:
+            comp2 = dim_reduction_components_embedding2 if dim_reduction_components_embedding2 else "auto"
+            print(f"  {model2_name}: {dim_reduction_method_embedding2.upper()} enabled, n_components={comp2}")
         if apply_zca_to_embedding2:
             print(f"  {model2_name}: ZCA whitening enabled, epsilon={zca_epsilon_embedding2}")
         if use_pairwise_loss_embedding2:
@@ -1024,10 +1061,12 @@ def run_comparison(
         pairs_to_compute=None,
         trial_data_dict=new_trials_dict,
         existing_trials_dict=existing_trials_dict,
-        apply_pca_model1=apply_pca_to_embedding1,
-        apply_pca_model2=apply_pca_to_embedding2,
-        pca_n_components_model1=pca_n_components_embedding1,
-        pca_n_components_model2=pca_n_components_embedding2,
+        dim_reduction_method_model1=dim_reduction_method_embedding1,
+        dim_reduction_method_model2=dim_reduction_method_embedding2,
+        dim_reduction_components_model1=dim_reduction_components_embedding1,
+        dim_reduction_components_model2=dim_reduction_components_embedding2,
+        pca_whitening_epsilon_model1=pca_whitening_epsilon_embedding1,
+        pca_whitening_epsilon_model2=pca_whitening_epsilon_embedding2,
         apply_zca_model1=apply_zca_to_embedding1,
         apply_zca_model2=apply_zca_to_embedding2,
         zca_epsilon_model1=zca_epsilon_embedding1,
@@ -1057,7 +1096,7 @@ def run_comparison(
     # Split and save results - use new_trials_dict which contains ONLY new trials
     per_embedding_dict, comparison_df = split_results_for_saving(result_df, new_trials_dict)
     
-    # Save Type 1: Per-embedding results (only NEW trials, skip if transformed)
+    # Save Type 1: Per-embedding results (ALWAYS save using full model name)
     if per_embedding_output_dir:
         print(f"\nSaving per-embedding results (Type 1)...")
         for embedding_name, emb_df in per_embedding_dict.items():
@@ -1065,18 +1104,12 @@ def run_comparison(
                 # Determine which corpus this embedding belongs to
                 if embedding_name == model1_name:
                     corpus_name = corpus1_name
-                    actual_embedding_name = embedding1_name
                 else:
                     corpus_name = corpus2_name
-                    actual_embedding_name = embedding2_name
                 
-                # Skip if model name differs from original (has config suffixes = transformed)
-                if embedding_name != actual_embedding_name:
-                    print(f"  Skipping {embedding_name} (transformed config, not raw embedding)")
-                    continue
-                
+                # Always save using full model name (includes all config suffixes)
                 save_per_embedding_results(emb_df, per_embedding_output_dir, 
-                                          actual_embedding_name, corpus_name)
+                                          embedding_name, corpus_name)
     
     # Save Type 2: Comparison results (always save)
     if comparison_output_path:

@@ -198,7 +198,7 @@ def generate_pytorch_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/ps
 
 if __name__ == "__main__":
     # Generate corpus for all three datasets
-    df = generate_corpus()
+    df = generate_pytorch_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus_pytorch_corrected.pkl')
     
     # Print example
     print("\n" + "="*80)
@@ -206,6 +206,9 @@ if __name__ == "__main__":
     print("="*80)
     print("\nFirst 3 rows:")
     print(df.head(3))
+
+    print("\nColumns:")
+    print(list(df.columns))
     
     print("\n" + "="*80)
     print("Example architecture details:")
@@ -213,9 +216,6 @@ if __name__ == "__main__":
     example = df.iloc[0]
     print(f"\nArchitecture Index: {example['arch_index']}")
     print(f"Architecture String: {example['arch_string']}")
-    print(f"\nPyTorch Code:\n{example['pytorch_code']}")
-    print(f"\nONNX Code:\n{example['onnx_code']}")
-    print(f"\nGrammar Code:\n{example['grammar_code']}")
     print(f"\nSample Properties:")
     prop_cols = [col for col in df.columns if 'cifar10-valid' in col][:5]
     for col in prop_cols:

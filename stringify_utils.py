@@ -61,6 +61,7 @@ GRAMMAR_MAP = {
 def parse_nb201_string(arch_str):
     """
     Parses '|op~0|+|op~0|op~1|+|op~0|op~1|op~2|' into a list of (src, dst, op_name).
+    Correctly parses source index from ~X suffix instead of relying on list position.
     """
     nodes = arch_str.strip('|').split('+')
     edges = []
@@ -74,32 +75,29 @@ def parse_nb201_string(arch_str):
     # nodes[1] defines edges to Node 2: "op~0|op~1" (from 0, then 1)
     # nodes[2] defines edges to Node 3: "op~0|op~1|op~2" (from 0, 1, 2)
     
-    # Parse edges to Node 1
-    ops = [e for e in nodes[0].split('|') if e]
-    edges.append((0, 1, ops[0].split('~')[0]))
-    
-    # Parse edges to Node 2
-    ops = [e for e in nodes[1].split('|') if e]
-    edges.append((0, 2, ops[0].split('~')[0]))
-    edges.append((1, 2, ops[1].split('~')[0]))
-    
-    # Parse edges to Node 3
-    ops = [e for e in nodes[2].split('|') if e]
-    edges.append((0, 3, ops[0].split('~')[0]))
-    edges.append((1, 3, ops[1].split('~')[0]))
-    edges.append((2, 3, ops[2].split('~')[0]))
+    # Parse edges to each target node
+    for target_idx, node_group in enumerate(nodes):
+        target = target_idx + 1  # Target nodes are 1, 2, 3
+        ops = [e for e in node_group.split('|') if e]
+        
+        for op_str in ops:
+            # Parse "op_name~source_idx"
+            parts = op_str.split('~')
+            op_name = parts[0]
+            source = int(parts[1])
+            edges.append((source, target, op_name))
     
     return edges
 
 def generate_dependency_classes():
     """Generate ReLUConvBN and ResNetBasicblock classes needed by Network."""
     return """class ReLUConvBN(nn.Module):
-    def __init__(self, C_in, C_out, kernel_size, stride, padding, dilation, affine=True, track_running_stats=True):
+    def __init__(self, channels, kernel_size, stride, padding, dilation, affine=True, track_running_stats=True):
         super(ReLUConvBN, self).__init__()
         self.op = nn.Sequential(
             nn.ReLU(inplace=False),
-            nn.Conv2d(C_in, C_out, kernel_size, stride=stride, padding=padding, dilation=dilation, bias=not affine),
-            nn.BatchNorm2d(C_out, affine=affine, track_running_stats=track_running_stats)
+            nn.Conv2d(channels, channels, kernel_size, stride=stride, padding=padding, dilation=dilation, bias=not affine),
+            nn.BatchNorm2d(channels, affine=affine, track_running_stats=track_running_stats)
         )
 
     def forward(self, x):
@@ -145,19 +143,19 @@ class ResNetBasicblock(nn.Module):
 def generate_network_class():
     """Generate the Network class that wraps Cell for full NASBench-201 architecture."""
     return """class Network(nn.Module):
-    def __init__(self, C, N, genotype, num_classes):
+    def __init__(self, channels, N, genotype, num_classes):
         super(Network, self).__init__()
-        self._C = C
-        self._layerN = N
+        self.C = channels
+        self.N = N
 
         self.stem = nn.Sequential(
-            nn.Conv2d(3, C, kernel_size=3, padding=1, bias=False), nn.BatchNorm2d(C)
+            nn.Conv2d(3, self.C, kernel_size=3, padding=1, bias=False), nn.BatchNorm2d(self.C)
         )
 
-        layer_channels = [C] * N + [C * 2] + [C * 2] * N + [C * 4] + [C * 4] * N
+        layer_channels = [self.C] * N + [self.C * 2] + [self.C * 2] * N + [self.C * 4] + [self.C * 4] * N
         layer_reductions = [False] * N + [True] + [False] * N + [True] + [False] * N
 
-        C_prev = C
+        C_prev = self.C
         self.cells = nn.ModuleList()
         for index, (C_curr, reduction) in enumerate(
             zip(layer_channels, layer_reductions)
@@ -165,9 +163,9 @@ def generate_network_class():
             if reduction:
                 cell = ResNetBasicblock(C_prev, C_curr, 2, True)
             else:
-                cell = Cell(C_prev, C_out=C_curr, stride=1)
+                cell = Cell(C_curr)
             self.cells.append(cell)
-            C_prev = cell.out_dim
+            C_prev = C_curr
         self._Layer = len(self.cells)
 
         self.lastact = nn.Sequential(nn.BatchNorm2d(C_prev), nn.ReLU(inplace=True))
@@ -219,7 +217,7 @@ Full architecture:
 - Final layers: BatchNorm2d + ReLU + Global Average Pooling + Linear layer to 10 classes.
 
 Helpers:
-- ReLUConvBN: Sequential ReLU -> Convolution -> BatchNormalization
+- ReLUConvBN: Sequential ReLU → Conv → BatchNorm (pre-activation)
 - ResNetBasicblock: Residual block with 2 ReLUConvBN plus 1 skip connection with input downsampling
 
 Training Details: SGD optimizer with momentum=0.9, weight_decay=5e-4, initial learning_rate=0.1 
@@ -228,20 +226,20 @@ with cosine annealing schedule over 200 epochs, batch_size=256, plus standard da
 
 def generate_helper_class():
     """
-    Generate the Conv2d_BatchNorm_ReLU helper class definition.
-    This helper wraps the common Conv->BN->ReLU pattern used in NASBench-201.
+    Generate the ReLU_Conv2d_BatchNorm helper class definition.
+    This helper wraps the pre-activation pattern: ReLU→Conv→BN used in NASBench-201.
     
     Returns:
         String containing the helper class definition
     """
     helper_code = [
-        "class Conv2d_BatchNorm_ReLU(nn.Module):",
-        "    def __init__(self, C_in, C_out, kernel_size, stride, padding):",
+        "class ReLU_Conv2d_BatchNorm(nn.Module):",
+        "    def __init__(self, channels, kernel_size, stride, padding):",
         "        super().__init__()",
         "        self.op = nn.Sequential(",
-        "            nn.Conv2d(C_in, C_out, kernel_size, stride=stride, padding=padding, bias=False),",
-        "            nn.BatchNorm2d(C_out),",
-        "            nn.ReLU(inplace=False)",
+        "            nn.ReLU(inplace=False),",
+        "            nn.Conv2d(channels, channels, kernel_size, stride=stride, padding=padding, bias=False),",
+        "            nn.BatchNorm2d(channels)",
         "        )",
         "    ",
         "    def forward(self, x):",
@@ -250,7 +248,7 @@ def generate_helper_class():
     return "\n".join(helper_code)
 
 def to_pytorch_code(edges, context_mode=None, primitives_mode='inline'):
-    """Format A: The Class Definition (Your Novelty)
+    """Format A: The Class Definition
     
     Args:
         edges: List of (src, dst, op) tuples representing the cell architecture
@@ -270,20 +268,17 @@ def to_pytorch_code(edges, context_mode=None, primitives_mode='inline'):
             return 'nn.AvgPool2d(kernel_size=3, stride=1, padding=1)'
         elif op == 'nor_conv_1x1':
             if primitives_mode == 'inline':
-                return 'nn.Sequential(nn.Conv2d(16, 16, kernel_size=1, stride=1, padding=0, bias=False), nn.BatchNorm2d(16), nn.ReLU())'
+                return 'nn.Sequential(nn.ReLU(inplace=False), nn.Conv2d(channels, channels, kernel_size=1, stride=1, padding=0, bias=False), nn.BatchNorm2d(channels))'
             else:  # helper or exclude_helper
-                return 'Conv2d_BatchNorm_ReLU(C_in=16, C_out=16, kernel_size=1, stride=1, padding=0)'
+                return 'ReLU_Conv2d_BatchNorm(channels, kernel_size=1, stride=1, padding=0)'
         elif op == 'nor_conv_3x3':
             if primitives_mode == 'inline':
-                return 'nn.Sequential(nn.Conv2d(16, 16, kernel_size=3, stride=1, padding=1, bias=False), nn.BatchNorm2d(16), nn.ReLU())'
+                return 'nn.Sequential(nn.ReLU(inplace=False), nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, bias=False), nn.BatchNorm2d(channels))'
             else:  # helper or exclude_helper
-                return 'Conv2d_BatchNorm_ReLU(C_in=16, C_out=16, kernel_size=3, stride=1, padding=1)'
+                return 'ReLU_Conv2d_BatchNorm(channels, kernel_size=3, stride=1, padding=1)'
         else:  # none or unknown
             return None
-    lines = ["class Cell(nn.Module):", "    def __init__(self, C_in, C_out, stride):", "        super().__init__()"]
-    lines.append("        self.in_dim = C_in")
-    lines.append("        self.out_dim = C_out")
-    lines.append("        self.stride = stride")
+    lines = ["class Cell(nn.Module):", "    def __init__(self, channels):", "        super().__init__()"]
     
     # Init Ops
     for i, (src, dst, op) in enumerate(edges):

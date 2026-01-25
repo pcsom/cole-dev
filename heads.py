@@ -127,7 +127,7 @@ class PerceiverResampler(nn.Module):
 class MLPSurrogate(nn.Module):
     """3-layer MLP for architecture performance prediction."""
     
-    def __init__(self, input_dim, hidden_dims=[512, 256, 128], output_dim=2, dropout=0.1):
+    def __init__(self, input_dim, hidden_dims=[128, 128, 128], output_dim=2, dropout=0.1):
         super(MLPSurrogate, self).__init__()
         
         layers = []
@@ -158,8 +158,16 @@ class XGBoostSurrogate:
     Supports CUDA acceleration when device='cuda'.
     """
     
-    def __init__(self, input_dim, output_dim=2, n_estimators=100, max_depth=6, 
-                 learning_rate=0.1, random_state=42, device='cpu'):
+    def __init__(self, input_dim, output_dim=2,
+                 n_estimators=2000,
+                 max_depth=6, 
+                 learning_rate=0.01, 
+                #  min_child_weight=5,
+                #  gamma=0.1,
+                 subsample=0.8,
+                 colsample_bytree=0.5,
+                 random_state=42, 
+                 device='cpu'):
         """
         Args:
             input_dim: Input feature dimension (unused, kept for API compatibility)
@@ -174,26 +182,26 @@ class XGBoostSurrogate:
         self.device = device
         
         # Create separate XGBoost models for each target if multi-output
+        xgb_params = {
+            'n_estimators': n_estimators,
+            'max_depth': max_depth,
+            'learning_rate': learning_rate,
+            # 'min_child_weight': min_child_weight,
+            # 'gamma': gamma,
+            'subsample': subsample,
+            'colsample_bytree': colsample_bytree,
+            'random_state': random_state,
+            'tree_method': 'hist',
+            'device': device,
+            'verbosity': 0
+        }
+
         if output_dim == 1:
-            self.models = [xgb.XGBRegressor(
-                n_estimators=n_estimators,
-                max_depth=max_depth,
-                learning_rate=learning_rate,
-                random_state=random_state,
-                tree_method='hist',
-                device=device,
-                verbosity=0
-            )]
+            self.models = [xgb.XGBRegressor(**xgb_params)]
         else:
-            self.models = [xgb.XGBRegressor(
-                n_estimators=n_estimators,
-                max_depth=max_depth,
-                learning_rate=learning_rate,
-                random_state=random_state + i,
-                tree_method='hist',
-                device=device,
-                verbosity=0
-            ) for i in range(output_dim)]
+            # Independent regressors is standard for XGB
+            self.models = [xgb.XGBRegressor(**{**xgb_params, 'random_state': random_state + i}) 
+                           for i in range(output_dim)]
     
     def to(self, device):
         """Move XGBoost models to specified device (CPU or CUDA)"""

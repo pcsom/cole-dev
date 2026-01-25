@@ -33,12 +33,17 @@ MODEL_CONFIGS = [
     },
     {
         'name': 'codellama/CodeLlama-34b-hf',
-        'display_name': 'codellama',
+        'display_name': 'codellama_34b',
         'sentence_transformer': False
     },
     {
         'name': 'codellama/CodeLlama-34b-Python-hf',
-        'display_name': 'codellama_python',
+        'display_name': 'codellama_python_34b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'codellama/CodeLlama-34b-Instruct-hf',
+        'display_name': 'codellama_instruct_34b',
         'sentence_transformer': False
     },
     {
@@ -77,6 +82,11 @@ MODEL_CONFIGS = [
         'sentence_transformer': False
     },
     {
+        'name': 'meta-llama/Llama-3.3-70B-Instruct',
+        'display_name': 'llama_3_3_70b_instruct',
+        'sentence_transformer': False
+    },
+    {
         'name': 'deepseek-ai/deepseek-coder-6.7b-instruct',
         'display_name': 'deepseek_coder_6_7b_instruct',
         'sentence_transformer': False
@@ -92,6 +102,21 @@ MODEL_CONFIGS = [
         'sentence_transformer': False
     },
     {
+        'name': 'mistralai/Mixtral-8x7B-v0.1',
+        'display_name': 'mixtral_8x7b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'mistralai/Yi-Coder-9B',
+        'display_name': 'yi_coder_9b',
+        'sentence_transformer': False
+    },
+    {
+        'name': 'mistralai/Yi-Coder-1.5B',
+        'display_name': 'yi_coder_1_5b',
+        'sentence_transformer': False
+    },
+    {
         'name': 'nomic-ai/CodeRankEmbed',
         'display_name': 'coderankembed',
         'sentence_transformer': True
@@ -104,6 +129,16 @@ MODEL_CONFIGS = [
     {
         'name': 'jinaai/jina-code-embeddings-1.5b',
         'display_name': 'jina_embed_code_1_5b',
+        'sentence_transformer': True
+    },
+    {
+        'name': 'nomic-ai/nomic-embed-code',
+        'display_name': 'nomic_embed_code',
+        'sentence_transformer': True
+    },
+    {
+        'name': 'Salesforce/SFR-Embedding-Code-2B_R',
+        'display_name': 'sfr_embedding_code_2b_r',
         'sentence_transformer': True
     },
 ]

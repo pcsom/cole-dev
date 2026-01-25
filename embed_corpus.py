@@ -36,9 +36,9 @@ def mean_pooling(model_output, attention_mask):
     sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
     return sum_embeddings / sum_mask
 
-def get_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=2048, multi_layer_embeddings=False):
+def get_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=2048, pooling_mode='mean'):
     """
-    Extract embeddings for a list of texts using mean pooling.
+    Extract embeddings for a list of texts using various pooling strategies.
     
     Args:
         texts: List of text strings
@@ -47,9 +47,17 @@ def get_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=20
         device: torch device
         batch_size: Batch size for processing
         max_length: Maximum sequence length
+        pooling_mode: Pooling strategy to use:
+            - 'mean': Average pooling on last layer (default)
+            - 'last_token': Last token of last layer
+            - 'multi_layer': Average pooling across multiple layers (every 4th layer)
+            - 'avg_avg': Average all tokens from all layers (Avg-Avg from paper)
     
     Returns:
-        numpy array of embeddings [num_texts, embedding_dim]
+        numpy array of embeddings
+        - For 'mean', 'last_token': [num_texts, embedding_dim]
+        - For 'multi_layer': [num_texts, num_selected_layers, embedding_dim]
+        - For 'avg_avg': [num_texts, embedding_dim]
     """
     all_embeddings = []
     
@@ -87,15 +95,32 @@ def get_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=20
             if getattr(model.config, 'use_cache', False):
                 model_inputs['use_cache'] = False
 
-            # Run inference
-            # If multi_layer_embeddings arg is True, we request hidden states
-            if multi_layer_embeddings:
+            # Run inference based on pooling mode
+            if pooling_mode in ['multi_layer', 'avg_avg']:
+                # Need hidden states for these modes
                 outputs = model(**model_inputs, output_hidden_states=True)
+            else:
+                # Standard forward pass
+                outputs = model(**model_inputs)
+            
+            # Apply pooling strategy
+            if pooling_mode == 'mean':
+                # Default: Mean pooling on last layer
+                embeddings = mean_pooling(outputs, attention_mask)
+                all_embeddings.append(embeddings.cpu().numpy())
                 
-                # Extract hidden states tuple: (layer_0, layer_1, ..., layer_N)
-                # Select every 4th layer, starting from the LAST one and going backwards
-                # e.g., indices: [-1, -5, -9, ...]
-                # We reverse the list at the end so they are in order of depth (shallow -> deep)
+            elif pooling_mode == 'last_token':
+                # Last token pooling (last valid token of last layer)
+                hidden_states = outputs.last_hidden_state  # (Batch, Seq_Len, Hidden_Dim)
+                sequence_lengths = attention_mask.sum(dim=1) - 1  # (Batch,)
+                
+                # Gather the vector corresponding to the last real token
+                indices = sequence_lengths.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, hidden_states.size(-1))
+                embeddings = torch.gather(hidden_states, 1, indices).squeeze(1)  # (Batch, Hidden_Dim)
+                all_embeddings.append(embeddings.cpu().numpy())
+                
+            elif pooling_mode == 'multi_layer':
+                # Multi-layer: Average pooling on selected layers (every 4th), keep separate
                 all_layers = outputs.hidden_states
                 selected_indices = range(len(all_layers) - 1, -1, -4)
                 selected_layers = [all_layers[i] for i in selected_indices][::-1]
@@ -106,37 +131,47 @@ def get_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=20
 
                 for layer_tensor in selected_layers:
                     # layer_tensor shape: (Batch, Seq_Len, Hidden_Dim)
-                    # Expand mask to match hidden dim: (Batch, Seq_Len, Hidden_Dim)
                     curr_mask = input_mask_expanded.expand(layer_tensor.size())
-                    
-                    # Mean Pool tokens for this specific layer
                     sum_embeddings = torch.sum(layer_tensor * curr_mask, 1)
-                    pooled_layer = sum_embeddings / sum_mask # (Batch, Hidden_Dim)
+                    pooled_layer = sum_embeddings / sum_mask  # (Batch, Hidden_Dim)
                     layer_vectors.append(pooled_layer.cpu().numpy())
                 
                 # Stack to get (Batch, Num_Selected_Layers, Hidden_Dim)
-                # We transpose locally to align with the list structure -> numpy stack
-                batch_result = np.stack(layer_vectors, axis=1) # Axis 1 is layers
+                batch_result = np.stack(layer_vectors, axis=1)
                 all_embeddings.append(batch_result)
-
+                
+            elif pooling_mode == 'avg_avg':
+                # Avg-Avg: Average all tokens from all layers
+                all_layers = outputs.hidden_states  # Tuple of (Batch, Seq_Len, Hidden_Dim)
+                
+                # Prepare mask for token averaging
+                input_mask_expanded = attention_mask.unsqueeze(-1).float()
+                sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+                
+                # Average tokens in each layer, then average across layers
+                layer_pooled = []
+                for layer_tensor in all_layers:
+                    curr_mask = input_mask_expanded.expand(layer_tensor.size())
+                    sum_embeddings = torch.sum(layer_tensor * curr_mask, 1)
+                    pooled = sum_embeddings / sum_mask  # (Batch, Hidden_Dim)
+                    layer_pooled.append(pooled)
+                
+                # Stack and average across layers: (Num_Layers, Batch, Hidden_Dim) -> (Batch, Hidden_Dim)
+                stacked = torch.stack(layer_pooled, dim=0)  # (Num_Layers, Batch, Hidden_Dim)
+                avg_avg_embedding = torch.mean(stacked, dim=0)  # (Batch, Hidden_Dim)
+                all_embeddings.append(avg_avg_embedding.cpu().numpy())
+                
             else:
-                # Get model output
-                outputs = model(**model_inputs)
-                
-                # Mean pooling
-                embeddings = mean_pooling(outputs, attention_mask)
-                
-                # Move to CPU and convert to numpy
-                all_embeddings.append(embeddings.cpu().numpy())
+                raise ValueError(f"Unknown pooling_mode: {pooling_mode}. Must be 'mean', 'last_token', 'multi_layer', or 'avg_avg'")
     
     return np.vstack(all_embeddings)
 
-def get_echo_embeddings(texts, model, tokenizer, device, batch_size=8, max_length=2048, pooling='last_token'):
+def get_echo_embeddings(texts, model, tokenizer, device, batch_size=8, max_length=2048, pooling='mean'):
     """
     Extract Echo Embeddings with corrected pooling logic.
     
     Args:
-        pooling: 'last_token' (Recommended for Llama/Mistral) or 'second_half_mean'.
+        pooling: 'last_token' (Recommended for Llama/Mistral) or 'mean'.
     """
     all_embeddings = []
     
@@ -195,7 +230,7 @@ def get_echo_embeddings(texts, model, tokenizer, device, batch_size=8, max_lengt
                 # Gather along sequence dimension (dim 1)
                 embeddings = torch.gather(hidden_states, 1, indices).squeeze(1)
                 
-            elif pooling == 'second_half_mean':
+            elif pooling == 'mean':
                 # Safe approximation: The second half is the latter 50% of the valid tokens.
                 # This avoids the Tokenizer mismatch bug.
                 batch_embeddings = []
@@ -242,8 +277,8 @@ def get_embeddings_sentence_transformers(texts, model, batch_size=16):
     return embeddings
 
 def embed_with_model(df, model_name, model_display_name, device='cuda', force=None, pytorch_only=False, 
-                     onnx_only=False, use_sentence_transformers=False, use_quantization=True, use_echo_embeddings=False,
-                     pytorch_context_mode=None, max_length=2048, multi_layer_embeddings=False):
+                     onnx_only=False, grammar_only=False, use_sentence_transformers=False, use_quantization=True, use_echo_embeddings=False,
+                     pytorch_context_mode=None, max_length=2048, pooling_mode='mean'):
     """
     Add embeddings from a specific model to the dataframe.
     
@@ -256,13 +291,14 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
                If None, uses FORCE_RECOMPUTE_EMBEDDINGS from config.
         pytorch_only: If True, only embed pytorch_code
         onnx_only: If True, only embed true_onnx_encoding (or columns containing 'onnx')
+        grammar_only: If True, only embed grammar_code
         use_sentence_transformers: If True, use sentence-transformers library instead of transformers
         use_quantization: If True, use 8-bit quantization for transformers models
         use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
         pytorch_context_mode: None (default), "network" (add full Network code), or "comment" (add docstring).
                              Affects pytorch_code embedding by appending context information.
         max_length: Maximum sequence length for tokenization
-        multi_layer_embeddings: If True, extract embeddings from multiple layers
+        pooling_mode: Pooling strategy ('mean', 'last_token', 'multi_layer', or 'avg_avg')
     
     Returns:
         DataFrame with added embedding columns
@@ -273,7 +309,8 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
     # Determine code types and expected columns
     if pytorch_only:
         # Find all columns in dataframe that contain 'pytorch' in their name
-        code_types = [col for col in df.columns if 'pytorch' in col.lower() and not col.endswith('_embedding')]
+        # code_types = [col for col in df.columns if 'pytorch' in col.lower() and not col.endswith('_embedding')]
+        code_types = ['pytorch_code_exclude_helper']
         if not code_types:
             print("WARNING: pytorch_only=True but no pytorch columns found in dataframe")
             code_types = ['pytorch_code']  # fallback
@@ -285,20 +322,27 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
             print("WARNING: onnx_only=True but 'true_onnx_encoding' column not found in dataframe")
             print(f"Available columns: {list(df.columns)}")
         print(f"Processing ONNX column: {code_types}")
+    elif grammar_only:
+        # Only embed the specific grammar_code column
+        code_types = ['grammar_code']
+        if 'grammar_code' not in df.columns:
+            print("WARNING: grammar_only=True but 'grammar_code' column not found in dataframe")
+            print(f"Available columns: {list(df.columns)}")
+        print(f"Processing grammar column: {code_types}")
     else:
         code_types = ['pytorch_code', 'onnx_code', 'grammar_code']
     
     # Build expected column names based on context mode
     expected_cols = []
     for ct in code_types:
-        # Build suffix based on echo, quantization, and multi-layer settings
+        # Build suffix based on echo, quantization, and pooling mode
         suffix_parts = []
         if use_echo_embeddings:
             suffix_parts.append('echo')
         if not use_quantization:
             suffix_parts.append('noquant')
-        if multi_layer_embeddings:
-            suffix_parts.append('multilayer')
+        if pooling_mode != 'mean':  # Only add suffix if not default
+            suffix_parts.append(pooling_mode)
         suffix = '_' + '_'.join(suffix_parts) if suffix_parts else ''
         
         # Apply context mode naming for any pytorch column
@@ -357,15 +401,21 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         
         # Load model with or without quantization
         if use_quantization:
-            print(f"Using 8-bit quantization for memory efficiency")
-            quantization_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0
-                # load_in_4bit=True,
-                # bnb_4bit_quant_type="nf4",
-                # bnb_4bit_use_double_quant=True,
-                # bnb_4bit_compute_dtype=torch.bfloat16
-            )
+            # Use 4-bit quantization for Mixtral, 8-bit for others
+            if 'mixtral_8x7b' in model_display_name.lower():
+                print(f"Using 4-bit quantization for Mixtral")
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16
+                )
+            else:
+                print(f"Using 8-bit quantization for memory efficiency")
+                quantization_config = BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    llm_int8_threshold=6.0
+                )
             
             model = AutoModel.from_pretrained(
                 model_name,
@@ -425,7 +475,7 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         elif use_echo_embeddings:
             embeddings = get_echo_embeddings(texts, model, tokenizer, device)
         else:
-            embeddings = get_embeddings(texts, model, tokenizer, device, max_length=max_length, multi_layer_embeddings=multi_layer_embeddings)
+            embeddings = get_embeddings(texts, model, tokenizer, device, max_length=max_length, pooling_mode=pooling_mode)
         
         # Add to dataframe as a column (store as list for each row)
         column_name = expected_cols[i]
@@ -499,7 +549,7 @@ def embed_corpus(
     use_echo_embeddings=False,
     use_quantization=True,
     max_length=2048,
-    multi_layer_embeddings=False
+    pooling_mode='mean'
 ):
     """
     Embed code representations in the corpus using multiple LLMs.
@@ -512,6 +562,7 @@ def embed_corpus(
         model_names: List of model display names to use. If None, uses all models from config.
         use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
         use_quantization: If True, use 8-bit quantization for transformer models (ignored for sentence-transformers)
+        pooling_mode: Pooling strategy ('mean', 'last_token', 'multi_layer', or 'avg_avg')
     
     Returns:
         DataFrame with embeddings
@@ -561,7 +612,7 @@ def embed_corpus(
             use_quantization=use_quantization,
             use_echo_embeddings=use_echo_embeddings,
             max_length=max_length,
-            multi_layer_embeddings=multi_layer_embeddings
+            pooling_mode=pooling_mode
         )
     
     # Save results
@@ -599,11 +650,12 @@ def add_embeddings_to_corpus(
     force=None,
     pytorch_only=False,
     onnx_only=False,
+    grammar_only=False,
     use_echo_embeddings=False,
     use_quantization=True,
     pytorch_context_mode=None,
     max_length=2048,
-    multi_layer_embeddings=False
+    pooling_mode='mean'
 ):
     """
     Add embeddings from a new model to an existing corpus.
@@ -623,10 +675,12 @@ def add_embeddings_to_corpus(
                If None, uses FORCE_RECOMPUTE_EMBEDDINGS from config.
         pytorch_only: If True, only embed pytorch_code
         onnx_only: If True, only embed true_onnx_encoding (or columns containing 'onnx')
+        grammar_only: If True, only embed grammar_code
         use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
         use_quantization: If True, use 8-bit quantization for transformer models (ignored for sentence-transformers)
         pytorch_context_mode: None (default), "network" (add full Network code), or "comment" (add docstring).
                              Affects pytorch_code embedding by appending context information.
+        pooling_mode: Pooling strategy ('mean', 'last_token', 'multi_layer', or 'avg_avg')
     
     Returns:
         DataFrame with added embeddings
@@ -665,7 +719,8 @@ def add_embeddings_to_corpus(
     # This MUST match the logic in embed_with_model to avoid losing columns!
     if pytorch_only:
         # Find all columns in dataframe that contain 'pytorch' in their name
-        code_types = [col for col in df_source.columns if 'pytorch' in col.lower() and not col.endswith('_embedding')]
+        # code_types = [col for col in df_source.columns if 'pytorch' in col.lower() and not col.endswith('_embedding')]
+        code_types = ['pytorch_code_exclude_helper']
         if not code_types:
             print("WARNING: pytorch_only=True but no pytorch columns found in dataframe")
             code_types = ['pytorch_code']  # fallback
@@ -677,19 +732,26 @@ def add_embeddings_to_corpus(
             print("WARNING: onnx_only=True but 'true_onnx_encoding' column not found in dataframe")
             print(f"Available columns: {list(df_source.columns)}")
         print(f"Processing ONNX column: {code_types}")
+    elif grammar_only:
+        # Only embed the specific grammar_code column
+        code_types = ['grammar_code']
+        if 'grammar_code' not in df_source.columns:
+            print("WARNING: grammar_only=True but 'grammar_code' column not found in dataframe")
+            print(f"Available columns: {list(df_source.columns)}")
+        print(f"Processing grammar column: {code_types}")
     else:
         code_types = ['pytorch_code', 'onnx_code', 'grammar_code']
     
     expected_embedding_cols = []
     for ct in code_types:
-        # Build suffix based on echo, quantization, and multi-layer settings
+        # Build suffix based on echo, quantization, and pooling mode
         suffix_parts = []
         if use_echo_embeddings:
             suffix_parts.append('echo')
         if not use_quantization:
             suffix_parts.append('noquant')
-        if multi_layer_embeddings:
-            suffix_parts.append('multilayer')
+        if pooling_mode != 'mean':  # Only add suffix if not default
+            suffix_parts.append(pooling_mode)
         suffix = '_' + '_'.join(suffix_parts) if suffix_parts else ''
         
         # Apply context mode naming for any pytorch column
@@ -737,10 +799,11 @@ def add_embeddings_to_corpus(
         use_quantization=use_quantization,
         pytorch_only=pytorch_only,
         onnx_only=onnx_only,
+        grammar_only=grammar_only,
         use_echo_embeddings=use_echo_embeddings,
         pytorch_context_mode=pytorch_context_mode,
         max_length=max_length,
-        multi_layer_embeddings=multi_layer_embeddings
+        pooling_mode=pooling_mode
     )
     
     # The new columns should match the expected_embedding_cols we computed earlier

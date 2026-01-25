@@ -16,7 +16,7 @@ def load_existing_trials(output_dir, embedding_name, corpus_name):
     
     Args:
         output_dir: Directory containing per-embedding CSV files
-        embedding_name: Name of the embedding
+        embedding_name: Name of the embedding (model name with config suffixes)
         corpus_name: Name of the corpus
     
     Returns:
@@ -26,7 +26,7 @@ def load_existing_trials(output_dir, embedding_name, corpus_name):
     if output_dir is None:
         return {}
     
-    csv_path = os.path.join(output_dir, f"{embedding_name}_{corpus_name}.csv")
+    csv_path = os.path.join(output_dir, f"{embedding_name}.{corpus_name}.csv")
     
     if not os.path.exists(csv_path):
         return {}
@@ -62,14 +62,14 @@ def save_per_embedding_results(results_df, output_dir, embedding_name, corpus_na
     Args:
         results_df: DataFrame with per-embedding trial results for ONE embedding
         output_dir: Directory to save CSV files
-        embedding_name: Name of the embedding (used in filename)
+        embedding_name: Name of the embedding/model (with config suffixes, used in filename)
         corpus_name: Name of the corpus (used in filename)
     
     Returns:
         Path to the saved CSV file
     """
     os.makedirs(output_dir, exist_ok=True)
-    base_filename = f"{embedding_name}_{corpus_name}.csv"
+    base_filename = f"{embedding_name}.{corpus_name}.csv"
     output_path = os.path.join(output_dir, base_filename)
     
     if os.path.exists(output_path):
@@ -167,7 +167,6 @@ def split_results_for_saving(results_df, trial_data_dict):
         for sample_size, trials in sample_dict.items():
             for fold, repeat, ktau, mse in trials:
                 trials_list.append({
-                    'embedding_name': embedding_name,
                     'sample_size': sample_size,
                     'fold': fold,
                     'repeat': repeat,
