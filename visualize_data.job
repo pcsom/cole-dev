@@ -1,0 +1,25 @@
+#run the visualization script
+#!/bin/bash
+source /home/hice1/mgullapalli6/.bashrc
+conda activate naslib39v2 
+# brief overview of fields
+# - input: path to the input csv file containing the data to be visualized. The csv file should contain a column for the encoding, a column for the test accuracy, and a column for the code (for reverse mapping).
+# - output_dir: directory to save the output visualization. The output will be saved as a png file in this directory.
+# - output_prefix: prefix for the output visualization file name. The output file name will be in the format {output_prefix}_gradient.png for the gradient plot and {output_prefix}_clustered.png for the clustered plot.
+# - encodings: column names for the encoding to be visualized. This column should contain the embeddings that will be used for t-SNE visualization.
+# - test_field: column name for the field to be plotted as hue in the gradient plot. This column should contain the test accuracy values that will be used for coloring the points in the gradient plot.
+# - code_field: column name for the code field to be used in reverse mapping. This column should contain the code strings that will be used for reverse mapping of clusters to code.    
+# - debug: whether to print debug information, such as the columns of the input dataframe. This can be useful for verifying that the correct columns are being used for encoding, test accuracy, and code.  
+# - range: range of values to be plotted in the gradient plot. This should be a list of two integers, specifying the minimum and maximum values to be plotted in the gradient plot. Points with test accuracy values outside this range will be filtered out from the gradient plot. This can be useful for focusing on a specific range of test accuracy values in the visualization.
+
+# example usage:
+python visualize_data.py \
+    --input /storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas2/nasbench201_corpus_onnx_paper_embedded.csv \
+    --output_dir /storage/ice-shared/vip-vvk/data/AOT/mgullapalli6/codenas2/tsne_output \
+    --output_prefix onnx_main \
+    --encodings modernbert_large_true_onnx_encoding_fp16_embedding codellama_python_7b_true_onnx_encoding_fp16_embedding \
+    --test_field cifar10-valid_test_accuracy \
+    --code_field pytorch_code_inline \
+    --debug True \
+    --range 80 100
+
