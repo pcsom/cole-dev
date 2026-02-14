@@ -21,3 +21,5 @@
 `heads.py`: Defines regressor models (MLP, XGB, etc).
 
 `softpca.py`: Custom PCA implementation that provides the option to perform 'whitening' on the data (unused at the time of paper submission)
+
+`visualize_data.py` : Create tsne visualizations, also can use the.job file if that is better for you.
