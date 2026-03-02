@@ -30,11 +30,12 @@ def get_arch_properties(arch_index, dataset='cifar10-valid'):
         'train_loss': info.get('train-loss', None),
         'train_time': info.get('train-all-time', None),  # Training time in seconds
         'flops': info.get('flops', None),  # FLOPs
+        'genertion_time': info.get('generation_time', None)  # Time to generate the architecture
     }
     
     return properties
 
-def generate_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus.csv',
+def generate_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/mgullapalli6/codenas/nasbench201_corpus.csv',
                     datasets=['cifar10-valid', 'cifar100', 'ImageNet16-120']):
     """
     Generate corpus of architecture code strings and their properties.
@@ -113,13 +114,15 @@ def load_corpus(corpus_path='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas
         DataFrame with corpus entries
     """
     if corpus_path.endswith('.pkl'):
-        return pd.read_pickle(corpus_path)
+        P = pd.read_pickle(corpus_path)
+        print(P.columns)
+        return P
     elif corpus_path.endswith('.csv'):
         return pd.read_csv(corpus_path)
     else:
         raise ValueError("Corpus path must be .pkl or .csv file")
 
-def generate_pytorch_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus_new.pkl',
+def generate_pytorch_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/mgullapalli6/codenas/nasbench201_corpus_new.pkl',
                            datasets=['cifar10-valid', 'cifar100', 'ImageNet16-120'],
                            context_mode=None):
     """
@@ -198,7 +201,7 @@ def generate_pytorch_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/ps
 
 if __name__ == "__main__":
     # Generate corpus for all three datasets
-    df = generate_pytorch_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus_pytorch_corrected.pkl')
+    df = generate_pytorch_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/mgullapalli6/codenas/nasbench201_corpus_pytorch_corrected.pkl')
     
     # Print example
     print("\n" + "="*80)

@@ -17,7 +17,7 @@ python visualize_data.py \
     --input /storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas2/nasbench201_corpus_onnx_paper_embedded.csv \
     --output_dir /storage/ice-shared/vip-vvk/data/AOT/mgullapalli6/codenas2/tsne_output \
     --output_prefix onnx_main \
-    --encodings modernbert_large_true_onnx_encoding_fp16_embedding codellama_python_7b_true_onnx_encoding_fp16_embedding \
+    --encodings modernbert_large_true_onnx_encoding_fp16_embedding \
     --test_field cifar10-valid_test_accuracy \
     --code_field pytorch_code_inline \
     --debug True \
