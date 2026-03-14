@@ -63,6 +63,7 @@ def drawTSNE(tsne_1,tsne_2, FILE_NAME, OUTPUT_FOLDER, legend_name, title_name, p
 
         plt.colorbar(sc, label=legend_name)
         #plt.legend( title=legend_name, bbox_to_anchor=(1, 1), loc='upper left')
+        
     if(plot_type == "discrete"):
         sns.stripplot(x=tsne_1, y=tsne_2, hue=plotting_number, palette=paletteDiscrete[:plotting_number.nunique()], jitter=True)
         #create an underbar matching colors to clusters
@@ -75,6 +76,7 @@ def drawTSNE(tsne_1,tsne_2, FILE_NAME, OUTPUT_FOLDER, legend_name, title_name, p
     plt.savefig(os.path.join(OUTPUT_FOLDER, f'tsne_plot_{title_name}_{FILE_NAME}.png'))
     print(f"image saved at {os.path.join(OUTPUT_FOLDER, f'tsne_plot_{title_name}_{FILE_NAME}.png')}")
     plt.show()
+
 
 def cluster(tsne_x, tsne_y, alpha):
     #run a HDBSCAN clustering on the tsne values and return a df containing the tsne values and theri cluster 
@@ -94,6 +96,52 @@ def createReversemapping(df, cluster_df, code):
         cluster_archs = merged_df[merged_df['cluster'] == cluster][code].tolist()
         reverse_mapping[int(cluster)] = cluster_archs
     return reverse_mapping    
+def createAnimation(tsne_1, tsne_2, FILE_NAME, OUTPUT_FOLDER,
+                    legend_name, title_name, plotting_number,
+                    plot_type="gradient", vrange=[0,1],
+                    pallete='viridis', reject=np.nan):
+
+    import matplotlib.animation as animation
+    import numpy as np
+    import os
+
+    fig, ax = plt.subplots(figsize=(10,8))
+    mask = (plotting_number <= vrange[1]) & (plotting_number != reject)
+    sc = ax.scatter(tsne_1[mask], tsne_2[mask], c=plotting_number[mask], cmap=pallete, vmin=vrange[0], vmax=vrange[1], alpha=0.3)
+    fig.colorbar(sc, ax=ax, label=legend_name)
+
+    def update(frame):
+
+        ax.clear()
+
+        mask = (plotting_number <= frame) & (plotting_number != reject)
+
+        sc = ax.scatter(
+            tsne_1[mask],
+            tsne_2[mask],
+            c=plotting_number[mask],
+            cmap=pallete,
+            vmin=vrange[0],
+            vmax=vrange[1],
+            alpha=0.3
+        )
+
+        ax.set_title(f"{title_name} (generation ≤ {frame})")
+
+    frames = np.arange(vrange[0], vrange[1] + 1, 10)
+
+    ani = animation.FuncAnimation(
+        fig,
+        update,
+        frames=frames,
+        repeat=False
+    )
+
+    output_path = os.path.join(OUTPUT_FOLDER, f"{FILE_NAME}.gif")
+
+    ani.save(output_path, writer="pillow", fps=5)
+
+    print(f"animation saved at {output_path}")
 def main():
     parser = argparse.ArgumentParser(description='t-SNE Visualization of Genome Embeddings')
     parser.add_argument('--input', type=str, default=f'/storage/ice-shared/vip-vvk/data/AOT/mgullapalli6/codenas/collecteddata_unified80.csv', help='Path to the input CSV file containing the data')
@@ -115,8 +163,8 @@ def main():
     cluster_df = cluster(tsne_1, tsne_2, alpha=5.0)
     
 
-    drawTSNE(tsne_1, tsne_2, f"tsne_average_generation_cifar10", args.output_dir,"generation", "average_generation_cifar10", df["average_generation_cifar10"],"gradient", vrange=[80,100], reject=-1000)
-    drawTSNE(tsne_1, tsne_2, f"tsne_average_generation_cifar100", args.output_dir,"generation", "average_generation_cifar100", df["average_generation_cifar100"],"gradient", vrange=[50,100], reject=-1000)
+    drawTSNE(tsne_1, tsne_2, f"tsne_average_generation_cifar10", args.output_dir,"generation", "average_generation_cifar10", df["average_generation_cifar10"],"gradient", vrange=[0,800], reject=-1000)
+    drawTSNE(tsne_1, tsne_2, f"tsne_average_generation_cifar100", args.output_dir,"generation", "average_generation_cifar100", df["average_generation_cifar100"],"gradient", vrange=[0, 800], reject=-1000)
     drawTSNE(tsne_1, tsne_2, f"tsne_average_predicted_accuracy_cifar10", args.output_dir,"predicted accuracy", "average_predicted_accuracy_cifar10", df["average_predicted_accuracy_cifar10"],"gradient", vrange=[80,100], reject=-1000)
     drawTSNE(tsne_1, tsne_2, f"tsne_average_predicted_accuracy_cifar100", args.output_dir,"predicted accuracy", "average_predicted_accuracy_cifar100", df["average_predicted_accuracy_cifar100"],"gradient", vrange=[50,100], reject=-1000)
     drawTSNE(tsne_1, tsne_2, f"tsne_average_real_accuracy_cifar10", args.output_dir,"accuracy", "average_real_accuracy_cifar10", df["cifar10-valid_test_accuracy"],"gradient", vrange=[0,20])
@@ -136,6 +184,8 @@ def main():
     drawTSNE(tsne_1, tsne_2, f"tsne_cifar100_real_accuracy", args.output_dir,"real_accuracy", "real_accuracy_cifar100", df['real_accuracy_cifar100'],"gradient", vrange=[50, 100], pallete='viridis', reject=-1000)
     if(args.cluster):
         drawTSNE(tsne_1, tsne_2, f"tsne_clustered", args.output_dir,"cluster", "clustered", cluster_df['cluster'],"discrete")
+    #create an animation based on generations for cifar10
+    createAnimation(tsne_1, tsne_2, f"tsne_animation_average_generation_cifar10", args.output_dir,"generation", "average_generation_cifar10", df["average_generation_cifar10"],"gradient", vrange=[0, 800], reject=-1000)
     #save the reverse mapping of cluster to arch index and arch string as a json
     reverse_mapping = createReversemapping(df, cluster_df, args.code_field)
     with open(os.path.join(args.output_dir, f'reverse_mapping.txt'), 'w') as f:
