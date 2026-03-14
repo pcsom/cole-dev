@@ -22,6 +22,7 @@ def createTSNE(df, encoding):
 
     #return results
     return X_tsne[:,0], X_tsne[:,1], df['cifar10-valid_test_accuracy']
+
 def drawTSNE(tsne_1,tsne_2, FILE_NAME, OUTPUT_FOLDER, legend_name, plotting_number,name, plot_type, vrange = [0,1], pallete = 'viridis', alpha=0.3, xlim=None, ylim=None):
     OUTPUT_FILE = os.path.join(OUTPUT_FOLDER, FILE_NAME)
     plt.figure(figsize=(10, 8))
@@ -106,7 +107,55 @@ def createReversemapping(df, cluster_df, code):
     for cluster in merged_df['cluster'].unique():
         cluster_archs = merged_df[merged_df['cluster'] == cluster][code].tolist()
         reverse_mapping[int(cluster)] = cluster_archs
-    return reverse_mapping    
+    return reverse_mapping
+
+def createAnimation(tsne_1, tsne_2, FILE_NAME, OUTPUT_FOLDER,
+                    legend_name, title_name, plotting_number,
+                    plot_type="gradient", vrange=[0,1],
+                    pallete='viridis', reject=np.nan):
+
+    import matplotlib.animation as animation
+    import numpy as np
+    import os
+
+    fig, ax = plt.subplots(figsize=(10,8))
+    mask = (plotting_number <= vrange[1]) & (plotting_number != reject)
+    sc = ax.scatter(tsne_1[mask], tsne_2[mask], c=plotting_number[mask], cmap=pallete, vmin=vrange[0], vmax=vrange[1], alpha=0.3)
+    fig.colorbar(sc, ax=ax, label=legend_name)
+
+    def update(frame):
+
+        ax.clear()
+
+        mask = (plotting_number <= frame) & (plotting_number != reject)
+
+        sc = ax.scatter(
+            tsne_1[mask],
+            tsne_2[mask],
+            c=plotting_number[mask],
+            cmap=pallete,
+            vmin=vrange[0],
+            vmax=vrange[1],
+            alpha=0.3
+        )
+
+        ax.set_title(f"{title_name} (generation ≤ {frame})")
+
+    frames = np.arange(vrange[0], vrange[1] + 1, 10)
+
+    ani = animation.FuncAnimation(
+        fig,
+        update,
+        frames=frames,
+        repeat=False
+    )
+
+    output_path = os.path.join(OUTPUT_FOLDER, f"{FILE_NAME}.gif")
+
+    ani.save(output_path, writer="pillow", fps=5)
+
+    print(f"animation saved at {output_path}")
+
 def main():
     parser = argparse.ArgumentParser(description='t-SNE Visualization of Genome Embeddings')
     parser.add_argument('--input', type=str, default=f'/storage/ice-shared/vip-vvk/data/AOT/mgullapalli6/codenas/collecteddata_unified.csv', help='Path to the input CSV file containing the data')
@@ -211,5 +260,9 @@ def main():
             f.write(f"Cluster {cluster1}:\n")
             for arch in archs:
                 f.write(f"  {arch}\n")
+
+    createAnimation(tsne_1, tsne_2, f"tsne_animation_average_generation_cifar100", args.output_dir,"generation", "average_generation_cifar100", df["average_generation_cifar100"],"gradient", vrange=[0, 800], reject=-1000)
+    
     print(f"reverse mapping saved at {os.path.join(args.output_dir, f'{args.output_prefix}_reverse_mapping.txt')}")
+
 main()
