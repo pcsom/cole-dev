@@ -23,7 +23,7 @@ def createTSNE(df, encoding):
     #return results
     return X_tsne[:,0], X_tsne[:,1], df['cifar10-valid_test_accuracy']
 
-def drawTSNE(tsne_1,tsne_2, FILE_NAME, OUTPUT_FOLDER, legend_name, plotting_number,name, plot_type, vrange = [0,1], pallete = 'viridis', alpha=0.3, xlim=None, ylim=None):
+def drawTSNE(tsne_1,tsne_2, FILE_NAME, OUTPUT_FOLDER, legend_name, plotting_number,name, plot_type, vrange = [0,1], pallete = 'Reds', alpha=0.3, xlim=None, ylim=None):
     OUTPUT_FILE = os.path.join(OUTPUT_FOLDER, FILE_NAME)
     plt.figure(figsize=(10, 8))
     #if plotting type is discreet : use a discret gradient or use continous gradient (deided by plotting number)
@@ -216,9 +216,8 @@ def main():
                     r_min, r_max = d_min, d_max
         
         drawTSNE(tsne_1, tsne_2, f"{args.output_prefix}_{test_field}", args.output_dir,test_field, df[test_field],"curated","gradient", vrange=[r_min, r_max], xlim=xlim, ylim=ylim)
-    drawTSNE(tsne_1, tsne_2, f"{args.output_prefix}_cifar10_discovery_curbed_grad", args.output_dir,"generation", df['generation_firstdiscovery_cifar10'],"generation","gradient", vrange=[0, 100], pallete='crest', xlim=xlim, ylim=ylim)
-    drawTSNE(tsne_1, tsne_2, f"{args.output_prefix}_cifar100_discovery_curbed_grad", args.output_dir,"generation", df['generation_firstdiscovery_cifar100'],"generation","gradient", vrange=[0, 100], pallete='crest', xlim=xlim, ylim=ylim)
-
+    drawTSNE(tsne_1, tsne_2, f"{args.output_prefix}_cifar10_discovery_curbed_grad", args.output_dir,"generation", df['generation_firstdiscovery_cifar10'],"generation","gradient", vrange=[0, 100], pallete='Reds', xlim=xlim, ylim=ylim)
+    drawTSNE(tsne_1, tsne_2, f"{args.output_prefix}_cifar100_discovery_curbed_grad", args.output_dir,"generation", df['generation_firstdiscovery_cifar100'],"generation","gradient", vrange=[0, 100], pallete='Reds', xlim=xlim, ylim=ylim)
     # Trajectory-only plots: only the individuals actually chosen and evaluated during NAS
     traj_suffix = f"_first{args.traj_max_iter}" if args.traj_max_iter is not None else ""
     if 'traj_generation_firstchosen_cifar10' in df.columns:
@@ -234,6 +233,20 @@ def main():
                 "generation_chosen", traj_gen_10,
                 "trajectory", "gradient", vrange=[0, int(traj_gen_10.max())], pallete='Reds', alpha=0.9, xlim=xlim, ylim=ylim
             )
+            drawTSNE(
+                tsne_1[traj_mask_10], tsne_2[traj_mask_10],
+                f"{args.output_prefix}_cifar10_trajectory_only{traj_suffix}", args.output_dir,
+                "generation_chosen", traj_gen_10,
+                "trajectory", "gradient", vrange=[0, int(traj_gen_10.max())], pallete='Reds', alpha=0.9, xlim=xlim, ylim=ylim
+            )
+            
+            traj_accuracy_10 = df.loc[traj_mask_10, 'traj_avg_predicted_accuracy_cifar100'].reset_index(drop=True)
+            drawTSNE(
+                tsne_1[traj_mask_10], tsne_2[traj_mask_10],
+                f"{args.output_prefix}_cifar10_trajectory_only{traj_suffix}", args.output_dir,
+                "generation_chosen", traj_gen_10,
+                "trajectory", "gradient", vrange=[0, int(traj_gen_10.max())], pallete='Reds', alpha=0.9, xlim=xlim, ylim=ylim
+            )
         else:
             print("Skipping cifar10 trajectory plot: no trajectory data found.")
     if 'traj_generation_firstchosen_cifar100' in df.columns:
@@ -243,16 +256,46 @@ def main():
         traj_mask_100 = traj_mask_100.values
         if traj_mask_100.any():
             traj_gen_100 = df.loc[traj_mask_100, 'traj_generation_firstchosen_cifar100'].reset_index(drop=True)
+            traj_accuracy_100 = df.loc[traj_mask_100, 'traj_avg_predicted_accuracy_cifar100'].reset_index(drop=True)
             drawTSNE(
                 tsne_1[traj_mask_100], tsne_2[traj_mask_100],
                 f"{args.output_prefix}_cifar100_trajectory_only{traj_suffix}", args.output_dir,
                 "generation_chosen", traj_gen_100,
                 "trajectory", "gradient", vrange=[0, int(traj_gen_100.max())], pallete='Reds', alpha=0.9, xlim=xlim, ylim=ylim
             )
+            drawTSNE(
+                tsne_1[traj_mask_100], tsne_2[traj_mask_100],
+                f"{args.output_prefix}_cifar100_trajectory_only{traj_suffix}_predicted", args.output_dir,
+                "predicted accuracy", traj_accuracy_100,
+                "trajectory", "gradient", vrange=[65, int(traj_accuracy_100.max())], pallete='Reds', alpha=0.9, xlim=xlim, ylim=ylim
+            )
+            # get real accuracy for the trajectory points and plot them as a gradient with a range of 65 to 100
+            traj_real_accuracy_100 = df.loc[traj_mask_100, 'cifar100_valid_accuracy'].reset_index(drop=True)
+            drawTSNE(
+                tsne_1[traj_mask_100], tsne_2[traj_mask_100],
+                f"{args.output_prefix}_cifar100_trajectory_only{traj_suffix}_real", args.output_dir,
+                "real accuracy", traj_real_accuracy_100,
+                "trajectory", "gradient", vrange=[65, int(traj_real_accuracy_100.max())], pallete='Reds', alpha=0.9, xlim=xlim, ylim=ylim
+            )
         else:
             print("Skipping cifar100 trajectory plot: no trajectory data found.")
     if(args.cluster):
         drawTSNE(tsne_1, tsne_2, f"{args.output_prefix}_clustered", args.output_dir,"cluster", cluster_df['cluster'],"clustered","discrete", xlim=xlim, ylim=ylim)
+    #save the surrogate misprediction as a gradient plot by taking |predicted_accuracy_cifar10 - cifar10-valid_test_accuracy| and |predicted_accuracy_cifar100 - cifar100_valid_accuracy| if neither category is -1000 and plotting them as a gradient plot with a range of 0 to 50
+    surrogate_mispred_10 = np.abs(df['predicted_accuracy_cifar10'] - df['cifar10-valid_test_accuracy'])
+    surrogate_mispred_100 = np.abs(df['predicted_accuracy_cifar100'] - df['cifar100_valid_accuracy'])
+    surrogate_mispred_10_mask = (df['predicted_accuracy_cifar10'] != -1000) & (df['cifar10-valid_test_accuracy'] != -1000)
+    surrogate_mispred_100_mask = (df['predicted_accuracy_cifar100'] != -1000) & (df['cifar100_valid_accuracy'] != -1000)
+    surrogate_mispred_10 = surrogate_mispred_10[surrogate_mispred_10_mask]
+    surrogate_mispred_100 = surrogate_mispred_100[surrogate_mispred_100_mask]
+    drawTSNE(tsne_1[surrogate_mispred_10_mask], tsne_2[surrogate_mispred_10_mask], f"{args.output_prefix}_surrogate_mispred_cifar10", args.output_dir,"|pred - true|", surrogate_mispred_10,"surrogate_misprediction","gradient", vrange=[0, 20], pallete='Reds', xlim=xlim, ylim=ylim)
+    drawTSNE(tsne_1[surrogate_mispred_100_mask], tsne_2[surrogate_mispred_100_mask], f"{args.output_prefix}_surrogate_mispred_cifar100", args.output_dir,"|pred - true|", surrogate_mispred_100,"surrogate_misprediction","gradient", vrange=[0, 20], pallete='Reds', xlim=xlim, ylim=ylim)
+    #also save the surrogate predicted values as a gradient plot with a range of 65 to 100
+    drawTSNE(tsne_1[surrogate_mispred_10_mask], tsne_2[surrogate_mispred_10_mask], f"{args.output_prefix}_surrogate_pred_cifar10", args.output_dir,"predicted_accuracy_cifar10", df['predicted_accuracy_cifar10'][surrogate_mispred_10_mask],"surrogate_prediction","gradient", vrange=[65, 100], pallete='Reds', xlim=xlim, ylim=ylim)
+    drawTSNE(tsne_1[surrogate_mispred_100_mask], tsne_2[surrogate_mispred_100_mask], f"{args.output_prefix}_surrogate_pred_cifar100", args.output_dir,"predicted_accuracy_cifar100", df['predicted_accuracy_cifar100'][surrogate_mispred_100_mask],"surrogate_prediction","gradient", vrange=[65, 100], pallete='Reds', xlim=xlim, ylim=ylim)
+    #and redo the real accuracy plots but only for the points where the surrogate prediction is not -1000 and the true accuracy is not -1000 to see if there are any patterns in the t-SNE space for the points where we have surrogate predictions
+    drawTSNE(tsne_1[surrogate_mispred_10_mask], tsne_2[surrogate_mispred_10_mask], f"{args.output_prefix}_true_acc_cifar10_with_surrogate", args.output_dir,"cifar10-valid_test_accuracy", df['cifar10-valid_test_accuracy'][surrogate_mispred_10_mask],"true_accuracy_with_surrogate","gradient", vrange=[65, 100], pallete='Reds', xlim=xlim, ylim=ylim)
+    drawTSNE(tsne_1[surrogate_mispred_100_mask], tsne_2[surrogate_mispred_100_mask], f"{args.output_prefix}_true_acc_cifar100_with_surrogate", args.output_dir,"cifar100_valid_accuracy", df['cifar100_valid_accuracy'][surrogate_mispred_100_mask],"true_accuracy_with_surrogate","gradient", vrange=[65, 100], pallete='Reds', xlim=xlim, ylim=ylim)
     #save the reverse mapping of cluster to arch index and arch string as a json
     reverse_mapping = createReversemapping(df, cluster_df, args.code_field)
     with open(os.path.join(args.output_dir, f'{args.output_prefix}_reverse_mapping.txt'), 'w') as f:
