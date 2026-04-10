@@ -36,7 +36,7 @@ def mean_pooling(model_output, attention_mask):
     sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
     return sum_embeddings / sum_mask
 
-def get_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=2048, pooling_mode='mean'):
+def get_embeddings(texts, model, tokenizer, device, batch_size=32, max_length=2048, pooling_mode='mean'):
     """
     Extract embeddings for a list of texts using various pooling strategies.
     
@@ -166,7 +166,7 @@ def get_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=20
     
     return np.vstack(all_embeddings)
 
-def get_echo_embeddings(texts, model, tokenizer, device, batch_size=8, max_length=2048, pooling='mean'):
+def get_echo_embeddings(texts, model, tokenizer, device, batch_size=16, max_length=2048, pooling='mean'):
     """
     Extract Echo Embeddings with corrected pooling logic.
     
@@ -277,7 +277,8 @@ def get_embeddings_sentence_transformers(texts, model, batch_size=16):
     return embeddings
 
 def embed_with_model(df, model_name, model_display_name, device='cuda', force=None, pytorch_only=False, 
-                     onnx_only=False, grammar_only=False, use_sentence_transformers=False, use_quantization=True, use_echo_embeddings=False,
+                     pytorch_all=False, onnx_only=False, grammar_only=False, use_sentence_transformers=False, 
+                     quantization='int8', use_echo_embeddings=False,
                      pytorch_context_mode=None, max_length=2048, pooling_mode='mean'):
     """
     Add embeddings from a specific model to the dataframe.
@@ -289,11 +290,12 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         device: Device to run model on
         force: If True, force recompute even if embeddings exist. 
                If None, uses FORCE_RECOMPUTE_EMBEDDINGS from config.
-        pytorch_only: If True, only embed pytorch_code
+        pytorch_only: If True, only embed pytorch_code_exclude_helper (overridden by pytorch_all)
+        pytorch_all: If True, embed all columns with 'pytorch' in their name (takes precedence over pytorch_only)
         onnx_only: If True, only embed true_onnx_encoding (or columns containing 'onnx')
         grammar_only: If True, only embed grammar_code
         use_sentence_transformers: If True, use sentence-transformers library instead of transformers
-        use_quantization: If True, use 8-bit quantization for transformers models
+        quantization: Quantization mode: 'int8', 'int4', 'fp16', or None/False for full precision
         use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
         pytorch_context_mode: None (default), "network" (add full Network code), or "comment" (add docstring).
                              Affects pytorch_code embedding by appending context information.
@@ -307,12 +309,18 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         force = FORCE_RECOMPUTE_EMBEDDINGS
     
     # Determine code types and expected columns
-    if pytorch_only:
+    if pytorch_all:
         # Find all columns in dataframe that contain 'pytorch' in their name
-        # code_types = [col for col in df.columns if 'pytorch' in col.lower() and not col.endswith('_embedding')]
-        code_types = ['pytorch_code_exclude_helper']
+        code_types = [col for col in df.columns if 'pytorch' in col.lower() and not col.endswith('_embedding')]
         if not code_types:
-            print("WARNING: pytorch_only=True but no pytorch columns found in dataframe")
+            print("WARNING: pytorch_all=True but no pytorch columns found in dataframe")
+            code_types = ['pytorch_code']  # fallback
+        print(f"Processing all pytorch columns: {code_types}")
+    elif pytorch_only:
+        # Only embed pytorch_code_exclude_helper
+        code_types = ['pytorch_code_exclude_helper']
+        if 'pytorch_code_exclude_helper' not in df.columns:
+            print("WARNING: pytorch_only=True but 'pytorch_code_exclude_helper' not found in dataframe")
             code_types = ['pytorch_code']  # fallback
         print(f"Processing pytorch columns: {code_types}")
     elif onnx_only:
@@ -339,7 +347,10 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         suffix_parts = []
         if use_echo_embeddings:
             suffix_parts.append('echo')
-        if not use_quantization:
+        # Add quantization info to suffix (always)
+        if quantization:
+            suffix_parts.append(quantization)  # Add 'int8', 'int4', or 'fp16'
+        else:
             suffix_parts.append('noquant')
         if pooling_mode != 'mean':  # Only add suffix if not default
             suffix_parts.append(pooling_mode)
@@ -399,24 +410,29 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
         
-        # Load model with or without quantization
-        if use_quantization:
-            # Use 4-bit quantization for Mixtral, 8-bit for others
-            if 'mixtral_8x7b' in model_display_name.lower():
-                print(f"Using 4-bit quantization for Mixtral")
-                quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_quant_type="nf4",
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16
-                )
-            else:
-                print(f"Using 8-bit quantization for memory efficiency")
-                quantization_config = BitsAndBytesConfig(
-                    load_in_8bit=True,
-                    llm_int8_threshold=6.0
-                )
-            
+        # Load model with specified quantization or precision
+        if quantization == 'int4':
+            print(f"Using 4-bit quantization")
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16
+            )
+            model = AutoModel.from_pretrained(
+                model_name,
+                quantization_config=quantization_config,
+                device_map='auto',
+                trust_remote_code=True,
+                use_safetensors=True
+            )
+            print(f"Model loaded with 4-bit quantization on {device}")
+        elif quantization == 'int8':
+            print(f"Using 8-bit quantization")
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_threshold=6.0
+            )
             model = AutoModel.from_pretrained(
                 model_name,
                 quantization_config=quantization_config,
@@ -426,13 +442,14 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
             )
             print(f"Model loaded with 8-bit quantization on {device}")
         else:
-            print(f"Loading model without quantization (full precision)")
+            # fp16 or None/False - full precision with fp16
+            print(f"Loading model in fp16 precision (no quantization)")
             model = AutoModel.from_pretrained(
                 model_name,
                 device_map='auto',
                 trust_remote_code=True,
                 use_safetensors=True,
-                torch_dtype=torch.float16  # Use fp16 for memory efficiency
+                torch_dtype=torch.float16
             )
             print(f"Model loaded in fp16 precision on {device}")
         
@@ -471,7 +488,7 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         
         # Get embeddings using appropriate method
         if use_sentence_transformers:
-            embeddings = get_embeddings_sentence_transformers(texts, model, batch_size=16)
+            embeddings = get_embeddings_sentence_transformers(texts, model, batch_size=32)
         elif use_echo_embeddings:
             embeddings = get_echo_embeddings(texts, model, tokenizer, device)
         else:
@@ -515,28 +532,7 @@ def embed_with_model(df, model_name, model_display_name, device='cuda', force=No
         torch.cuda.ipc_collect()  # Additional cleanup for inter-process memory
     
     print(f"GPU memory cleared")
-    
-    # Step 4: Delete model from HuggingFace cache to free disk space
-    print(f"Deleting {model_display_name} from HuggingFace cache to free disk space...")
-    try:
-        # Get HuggingFace cache directory
-        cache_dir = os.environ.get('HF_HOME', 
-                    os.environ.get('TRANSFORMERS_CACHE', 
-                    os.path.join(Path.home(), '.cache', 'huggingface')))
-        
-        # Model cache folder name format: models--org--model-name
-        model_cache_name = model_name.replace('/', '--')
-        model_cache_path = os.path.join(cache_dir, 'hub', f'models--{model_cache_name}')
-        
-        if os.path.exists(model_cache_path):
-            shutil.rmtree(model_cache_path)
-            print(f"Deleted cache directory: {model_cache_path}")
-        else:
-            print(f"Cache directory not found (may have been cleaned already): {model_cache_path}")
-    except Exception as e:
-        print(f"Warning: Could not delete model cache: {e}")
-    
-    print(f"Memory and disk cleaned. Ready for next model.\n")
+    print(f"Memory cleaned. Ready for next model.\n")
     
     return df
 
@@ -547,7 +543,7 @@ def embed_corpus(
     use_half=True,
     model_names=None,
     use_echo_embeddings=False,
-    use_quantization=True,
+    quantization='int8',
     max_length=2048,
     pooling_mode='mean'
 ):
@@ -561,7 +557,7 @@ def embed_corpus(
         use_half: If True, only process first half of corpus
         model_names: List of model display names to use. If None, uses all models from config.
         use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
-        use_quantization: If True, use 8-bit quantization for transformer models (ignored for sentence-transformers)
+        quantization: Quantization mode: 'int8' (default), 'int4', 'fp16', or None/False for full precision
         pooling_mode: Pooling strategy ('mean', 'last_token', 'multi_layer', or 'avg_avg')
     
     Returns:
@@ -609,7 +605,7 @@ def embed_corpus(
             model_config['display_name'],
             device=device,
             use_sentence_transformers=model_config.get('sentence_transformer', False),
-            use_quantization=use_quantization,
+            quantization=quantization,
             use_echo_embeddings=use_echo_embeddings,
             max_length=max_length,
             pooling_mode=pooling_mode
@@ -649,10 +645,11 @@ def add_embeddings_to_corpus(
     device='cuda',
     force=None,
     pytorch_only=False,
+    pytorch_all=False,
     onnx_only=False,
     grammar_only=False,
     use_echo_embeddings=False,
-    use_quantization=True,
+    quantization='int8',
     pytorch_context_mode=None,
     max_length=2048,
     pooling_mode='mean'
@@ -673,11 +670,12 @@ def add_embeddings_to_corpus(
         device: Device to run model on
         force: If True, force recompute even if embeddings exist.
                If None, uses FORCE_RECOMPUTE_EMBEDDINGS from config.
-        pytorch_only: If True, only embed pytorch_code
+        pytorch_only: If True, only embed pytorch_code_exclude_helper (overridden by pytorch_all)
+        pytorch_all: If True, embed all columns with 'pytorch' in their name (takes precedence over pytorch_only)
         onnx_only: If True, only embed true_onnx_encoding (or columns containing 'onnx')
         grammar_only: If True, only embed grammar_code
         use_echo_embeddings: If True, use echo embeddings (repeat text twice, pool second half)
-        use_quantization: If True, use 8-bit quantization for transformer models (ignored for sentence-transformers)
+        quantization: Quantization mode: 'int8' (default), 'int4', 'fp16', or None/False for full precision
         pytorch_context_mode: None (default), "network" (add full Network code), or "comment" (add docstring).
                              Affects pytorch_code embedding by appending context information.
         pooling_mode: Pooling strategy ('mean', 'last_token', 'multi_layer', or 'avg_avg')
@@ -717,12 +715,18 @@ def add_embeddings_to_corpus(
     
     # Build expected embedding column names based on context mode
     # This MUST match the logic in embed_with_model to avoid losing columns!
-    if pytorch_only:
+    if pytorch_all:
         # Find all columns in dataframe that contain 'pytorch' in their name
-        # code_types = [col for col in df_source.columns if 'pytorch' in col.lower() and not col.endswith('_embedding')]
-        code_types = ['pytorch_code_exclude_helper']
+        code_types = [col for col in df_source.columns if 'pytorch' in col.lower() and not col.endswith('_embedding')]
         if not code_types:
-            print("WARNING: pytorch_only=True but no pytorch columns found in dataframe")
+            print("WARNING: pytorch_all=True but no pytorch columns found in dataframe")
+            code_types = ['pytorch_code']  # fallback
+        print(f"Processing all pytorch columns: {code_types}")
+    elif pytorch_only:
+        # Only embed pytorch_code_exclude_helper
+        code_types = ['pytorch_code_exclude_helper']
+        if 'pytorch_code_exclude_helper' not in df_source.columns:
+            print("WARNING: pytorch_only=True but 'pytorch_code_exclude_helper' not found in dataframe")
             code_types = ['pytorch_code']  # fallback
         print(f"Processing pytorch columns: {code_types}")
     elif onnx_only:
@@ -748,7 +752,10 @@ def add_embeddings_to_corpus(
         suffix_parts = []
         if use_echo_embeddings:
             suffix_parts.append('echo')
-        if not use_quantization:
+        # Add quantization info to suffix (always)
+        if quantization:
+            suffix_parts.append(quantization)  # Add 'int8', 'int4', or 'fp16'
+        else:
             suffix_parts.append('noquant')
         if pooling_mode != 'mean':  # Only add suffix if not default
             suffix_parts.append(pooling_mode)
@@ -796,8 +803,9 @@ def add_embeddings_to_corpus(
         device=device,
         force=force,
         use_sentence_transformers=model_config.get('sentence_transformer', False),
-        use_quantization=use_quantization,
+        quantization=quantization,
         pytorch_only=pytorch_only,
+        pytorch_all=pytorch_all,
         onnx_only=onnx_only,
         grammar_only=grammar_only,
         use_echo_embeddings=use_echo_embeddings,

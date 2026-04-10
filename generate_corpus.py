@@ -2,6 +2,7 @@ import torch
 import pickle
 import json
 import pandas as pd
+import numpy as np
 from tqdm import tqdm
 from stringify_utils import arch_to_all_formats, arch_to_pytorch_code, get_api, get_architecture_string
 
@@ -35,7 +36,65 @@ def get_arch_properties(arch_index, dataset='cifar10-valid'):
     
     return properties
 
-def generate_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/mgullapalli6/codenas/nasbench201_corpus.csv',
+def get_arch_properties_averaged(arch_index, dataset='cifar10-valid'):
+    """
+    Get regressable properties (fitness metrics) for an architecture.
+    Explicitly averages results across the 3 standard NAS-Bench-201 seeds (777, 888, 999).
+    
+    Args:
+        arch_index: Architecture index in NASBench-201
+        dataset: Dataset to query ('cifar10-valid', 'cifar100', 'ImageNet16-120')
+    
+    Returns:
+        Dictionary of properties (mean values)
+    """
+    api = get_api()
+    
+    # 1. Query detailed results for this index and dataset
+    # This returns a dict where keys are seeds (777, 888, 999)
+    results_dict = api.query_by_index(arch_index, dataset)
+    
+    # Storage for metrics across seeds
+    accuracies = {'test': [], 'valid': [], 'train': []}
+    losses = {'test': [], 'valid': [], 'train': []}
+    times = []
+    
+    # 2. Iterate through all available seeds and extract 200-epoch metrics
+    for seed, result_obj in results_dict.items():
+        # result_obj is an instance of ResultsCount
+        # get_eval returns: {'accuracy': X, 'loss': Y, ...}
+        
+        # Test Data
+        test_info = result_obj.get_eval('x-test') 
+        accuracies['test'].append(test_info['accuracy'])
+        losses['test'].append(test_info['loss'])
+        
+        # Validation Data
+        valid_info = result_obj.get_eval('x-valid')
+        accuracies['valid'].append(valid_info['accuracy'])
+        losses['valid'].append(valid_info['loss'])
+        
+        # Training Data
+        train_info = result_obj.get_train()
+        accuracies['train'].append(train_info['accuracy'])
+        losses['train'].append(train_info['loss'])
+        times.append(train_info['all_time'])
+
+    # 3. Calculate Means
+    properties = {
+        'test_accuracy': np.mean(accuracies['test']),
+        'valid_accuracy': np.mean(accuracies['valid']),
+        'train_accuracy': np.mean(accuracies['train']),
+        'test_loss': np.mean(losses['test']),
+        'valid_loss': np.mean(losses['valid']),
+        'train_loss': np.mean(losses['train']),
+        'train_time': np.mean(times),
+        'flops': results_dict[777].get_compute_costs(dataset)['flops'], # FLOPs are constant across seeds
+    }
+    
+    return properties
+
+def generate_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus.csv',
                     datasets=['cifar10-valid', 'cifar100', 'ImageNet16-120']):
     """
     Generate corpus of architecture code strings and their properties.
@@ -71,7 +130,7 @@ def generate_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/mgullapall
         
         # Get properties for each dataset and add to entry
         for dataset in datasets:
-            props = get_arch_properties(arch_idx, dataset=dataset)
+            props = get_arch_properties_averaged(arch_idx, dataset=dataset)
             # Prefix keys with dataset name
             for key, value in props.items():
                 entry[f'{dataset}_{key}'] = value
@@ -201,7 +260,7 @@ def generate_pytorch_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/mg
 
 if __name__ == "__main__":
     # Generate corpus for all three datasets
-    df = generate_pytorch_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/mgullapalli6/codenas/nasbench201_corpus_pytorch_corrected.pkl')
+    df = generate_pytorch_corpus(output_path='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus_averaged.pkl')
     
     # Print example
     print("\n" + "="*80)

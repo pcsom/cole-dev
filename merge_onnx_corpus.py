@@ -8,9 +8,9 @@ import numpy as np
 from collections import defaultdict
 
 # Paths
-EXISTING_CORPUS_PATH = '/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus.pkl'
+EXISTING_CORPUS_PATH = '/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus_averaged.pkl'
 ONNX_CSV_PATH = '/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/onnx/encodings/chain_slim_input/nasbench201.csv'
-OUTPUT_PATH = '/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus_onnx.pkl'
+OUTPUT_PATH = '/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus_onnx_averaged_paper.pkl'
 
 def round_to_precision(values, precision):
     """Round values to specified precision."""
@@ -71,8 +71,8 @@ def main():
     print(f"  Columns: {list(df_corpus.columns)}")
     
     # Check for accuracy column
-    if 'cifar10-valid_test_accuracy' not in df_corpus.columns:
-        print("\nERROR: 'cifar10-valid_test_accuracy' column not found!")
+    if 'cifar10_test_accuracy' not in df_corpus.columns:
+        print("\nERROR: 'cifar10_test_accuracy' column not found!")
         print(f"Available columns: {list(df_corpus.columns)}")
         return
     
@@ -94,7 +94,7 @@ def main():
         return
     
     # Extract accuracies
-    corpus_accs = df_corpus['cifar10-valid_test_accuracy'].values
+    corpus_accs = df_corpus['cifar10_test_accuracy'].values
     onnx_accs = df_onnx['accuracy'].values
     
     print(f"\nAccuracy statistics:")
@@ -106,7 +106,7 @@ def main():
     remaining_corpus = list(range(len(df_corpus)))
     remaining_onnx = list(range(len(df_onnx)))
     
-    precisions = [0.00001, 0.0001, 0.001]
+    precisions = [0.00001, 0.0001, 0.001, 0.01, 0.02]
     
     for precision in precisions:
         if len(remaining_corpus) == 0 or len(remaining_onnx) == 0:
@@ -153,7 +153,7 @@ def main():
     df_aligned['true_onnx_encoding'] = df_onnx.iloc[onnx_indices]['onnx_encoding'].values
     
     # Verify accuracy alignment
-    corpus_matched_accs = df_aligned['cifar10-valid_test_accuracy'].values
+    corpus_matched_accs = df_aligned['cifar10_test_accuracy'].values
     onnx_matched_accs = df_onnx.iloc[onnx_indices]['accuracy'].values
     acc_diff = np.abs(corpus_matched_accs - onnx_matched_accs)
     

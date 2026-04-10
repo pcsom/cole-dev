@@ -159,7 +159,7 @@ class XGBoostSurrogate:
     """
     
     def __init__(self, input_dim, output_dim=2,
-                 n_estimators=2000,
+                 n_estimators=3000,
                  max_depth=6, 
                  learning_rate=0.01, 
                 #  min_child_weight=5,

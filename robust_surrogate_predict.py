@@ -425,7 +425,12 @@ def subsampled_repeated_kfold_comparison(
     use_single_target_model1=False,
     use_single_target_model2=False,
     head_type_model1='mlp',
-    head_type_model2='mlp'
+    head_type_model2='mlp',
+    per_embedding_output_dir=None,
+    comparison_output_path=None,
+    corpus1_name=None,
+    corpus2_name=None,
+    comparison_label=None
 ):
     """
     Perform subsampled repeated k-fold CV with corrected statistical testing.
@@ -507,10 +512,10 @@ def subsampled_repeated_kfold_comparison(
         trials_to_compute = total_trials_needed - existing_trials
         
         if trials_to_compute <= 0:
-            print(f"Already have {existing_trials} trials, skipping")
-            continue
-        
-        print(f"Computing {trials_to_compute} new trials (have {existing_trials}, need {total_trials_needed})")
+            print(f"Already have {existing_trials} trials, no new computation needed")
+            print(f"Computing statistics and saving comparison results...")
+        else:
+            print(f"Computing {trials_to_compute} new trials (have {existing_trials}, need {total_trials_needed})")
         
         differences = []  # Store Model1 - Model2 for ONLY NEW trials
         model1_ktau_scores = []  # Track individual model1 Kendall's Tau scores
@@ -525,111 +530,120 @@ def subsampled_repeated_kfold_comparison(
         start_trial = existing_trials
         total_trials = 0
         
-        # Outer loop: Repeat the CV procedure
-        for repeat in tqdm(range(n_repeats), desc=f"Repeats (S={sample_size})"):
-            # Create stratified k-fold with different seed per repeat
-            skf = StratifiedKFold(n_splits=n_folds, shuffle=True, 
-                                 random_state=random_state + repeat)
-            
-            # Inner loop: Folds
-            for fold_idx, (pool_idx, test_idx) in enumerate(skf.split(X1, y_bins)):
-                trial_number = repeat * n_folds + fold_idx
+        # Only run trials if we need new ones
+        if trials_to_compute > 0:
+            # Outer loop: Repeat the CV procedure
+            for repeat in tqdm(range(n_repeats), desc=f"Repeats (S={sample_size})"):
+                # Create stratified k-fold with different seed per repeat
+                skf = StratifiedKFold(n_splits=n_folds, shuffle=True, 
+                                     random_state=random_state + repeat)
                 
-                # Skip trials we already computed
-                if trial_number < start_trial:
-                    continue
+                # Inner loop: Folds
+                for fold_idx, (pool_idx, test_idx) in enumerate(skf.split(X1, y_bins)):
+                    trial_number = repeat * n_folds + fold_idx
+                    
+                    # Skip trials we already computed
+                    if trial_number < start_trial:
+                        continue
+                    
+                    if total_trials >= trials_to_compute:
+                        break
+                    
+                    # Training pool (4 folds)
+                    X1_pool, y_pool = X1[pool_idx], y[pool_idx]
+                    X2_pool = X2[pool_idx]
+                    
+                    # Test set (1 fold)
+                    X1_test, y_test = X1[test_idx], y[test_idx]
+                    X2_test = X2[test_idx]
+                    
+                    # Train Model 1
+                    seed1 = random_state + repeat * 1000 + fold_idx * 100
+                    result1 = train_model_on_subsample(
+                        X1_pool, y_pool, X1_test, y_test,
+                        sample_size=min(sample_size, len(X1_pool)),
+                        random_state=seed1,
+                        epochs=epochs, lr=lr, batch_size=batch_size, device=device,
+                        dim_reduction_method=dim_reduction_method_model1,
+                        dim_reduction_components=dim_reduction_components_model1,
+                        pca_whitening_epsilon=pca_whitening_epsilon_model1,
+                        apply_zca=apply_zca_model1,
+                        zca_epsilon=zca_epsilon_model1,
+                        use_pairwise_loss=use_pairwise_loss_model1,
+                        use_single_target=use_single_target_model1,
+                        head_type=head_type_model1
+                    )
+                    
+                    # Train Model 2 on SAME subsample indices
+                    seed2 = random_state + repeat * 1000 + fold_idx * 100 + 1
+                    result2 = train_model_on_subsample(
+                        X2_pool, y_pool, X2_test, y_test,
+                        sample_size=min(sample_size, len(X2_pool)),
+                        random_state=seed2,
+                        epochs=epochs, lr=lr, batch_size=batch_size, device=device,
+                        dim_reduction_method=dim_reduction_method_model2,
+                        dim_reduction_components=dim_reduction_components_model2,
+                        pca_whitening_epsilon=pca_whitening_epsilon_model2,
+                        apply_zca=apply_zca_model2,
+                        zca_epsilon=zca_epsilon_model2,
+                        use_pairwise_loss=use_pairwise_loss_model2,
+                        use_single_target=use_single_target_model2,
+                        head_type=head_type_model2
+                    )
+                    
+                    # Store individual scores and difference (using Kendall's Tau)
+                    score1 = result1['kendall_tau']
+                    score2 = result2['kendall_tau']
+                    model1_ktau_scores.append(score1)
+                    model2_ktau_scores.append(score2)
+                    diff_ktau = score1 - score2
+                    differences.append(diff_ktau)
+                    differences_ktau.append(diff_ktau)
+                    
+                    # Also store MSE scores and differences
+                    model1_mse_scores.append(result1['mse'])
+                    model2_mse_scores.append(result2['mse'])
+                    diff_mse = result1['mse'] - result2['mse']
+                    differences_mse.append(diff_mse)
+                    
+                    # Track individual NEW trial data for statistics and Type 1 CSV saving
+                    if trial_data_dict is not None:
+                        # Always track trials for statistics (needed for comparison)
+                        # Initialize dicts for model1 and model2 if not present
+                        if model1_name not in trial_data_dict:
+                            trial_data_dict[model1_name] = {}
+                        if model2_name not in trial_data_dict:
+                            trial_data_dict[model2_name] = {}
+                        
+                        # Initialize sample_size list if not present
+                        if sample_size not in trial_data_dict[model1_name]:
+                            trial_data_dict[model1_name][sample_size] = []
+                        if sample_size not in trial_data_dict[model2_name]:
+                            trial_data_dict[model2_name][sample_size] = []
+                        
+                        # Append NEW trial data: (fold, repeat, ktau, mse)
+                        trial_data_dict[model1_name][sample_size].append(
+                            (fold_idx, repeat, result1['kendall_tau'], result1['mse'])
+                        )
+                        trial_data_dict[model2_name][sample_size].append(
+                            (fold_idx, repeat, result2['kendall_tau'], result2['mse'])
+                        )
+                    
+                    total_trials += 1
                 
                 if total_trials >= trials_to_compute:
                     break
-                
-                # Training pool (4 folds)
-                X1_pool, y_pool = X1[pool_idx], y[pool_idx]
-                X2_pool = X2[pool_idx]
-                
-                # Test set (1 fold)
-                X1_test, y_test = X1[test_idx], y[test_idx]
-                X2_test = X2[test_idx]
-                
-                # Train Model 1
-                seed1 = random_state + repeat * 1000 + fold_idx * 100
-                result1 = train_model_on_subsample(
-                    X1_pool, y_pool, X1_test, y_test,
-                    sample_size=min(sample_size, len(X1_pool)),
-                    random_state=seed1,
-                    epochs=epochs, lr=lr, batch_size=batch_size, device=device,
-                    dim_reduction_method=dim_reduction_method_model1,
-                    dim_reduction_components=dim_reduction_components_model1,
-                    pca_whitening_epsilon=pca_whitening_epsilon_model1,
-                    apply_zca=apply_zca_model1,
-                    zca_epsilon=zca_epsilon_model1,
-                    use_pairwise_loss=use_pairwise_loss_model1,
-                    use_single_target=use_single_target_model1,
-                    head_type=head_type_model1
-                )
-                
-                # Train Model 2 on SAME subsample indices
-                seed2 = random_state + repeat * 1000 + fold_idx * 100 + 1
-                result2 = train_model_on_subsample(
-                    X2_pool, y_pool, X2_test, y_test,
-                    sample_size=min(sample_size, len(X2_pool)),
-                    random_state=seed2,
-                    epochs=epochs, lr=lr, batch_size=batch_size, device=device,
-                    dim_reduction_method=dim_reduction_method_model2,
-                    dim_reduction_components=dim_reduction_components_model2,
-                    pca_whitening_epsilon=pca_whitening_epsilon_model2,
-                    apply_zca=apply_zca_model2,
-                    zca_epsilon=zca_epsilon_model2,
-                    use_pairwise_loss=use_pairwise_loss_model2,
-                    use_single_target=use_single_target_model2,
-                    head_type=head_type_model2
-                )
-                
-                # Store individual scores and difference (using Kendall's Tau)
-                score1 = result1['kendall_tau']
-                score2 = result2['kendall_tau']
-                model1_ktau_scores.append(score1)
-                model2_ktau_scores.append(score2)
-                diff_ktau = score1 - score2
-                differences.append(diff_ktau)
-                differences_ktau.append(diff_ktau)
-                
-                # Also store MSE scores and differences
-                model1_mse_scores.append(result1['mse'])
-                model2_mse_scores.append(result2['mse'])
-                diff_mse = result1['mse'] - result2['mse']
-                differences_mse.append(diff_mse)
-                
-                # Track individual NEW trial data for statistics and Type 1 CSV saving
-                if trial_data_dict is not None:
-                    # Always track trials for statistics (needed for comparison)
-                    # Initialize dicts for model1 and model2 if not present
-                    if model1_name not in trial_data_dict:
-                        trial_data_dict[model1_name] = {}
-                    if model2_name not in trial_data_dict:
-                        trial_data_dict[model2_name] = {}
-                    
-                    # Initialize sample_size list if not present
-                    if sample_size not in trial_data_dict[model1_name]:
-                        trial_data_dict[model1_name][sample_size] = []
-                    if sample_size not in trial_data_dict[model2_name]:
-                        trial_data_dict[model2_name][sample_size] = []
-                    
-                    # Append NEW trial data: (fold, repeat, ktau, mse)
-                    trial_data_dict[model1_name][sample_size].append(
-                        (fold_idx, repeat, result1['kendall_tau'], result1['mse'])
-                    )
-                    trial_data_dict[model2_name][sample_size].append(
-                        (fold_idx, repeat, result2['kendall_tau'], result2['mse'])
-                    )
-                
-                total_trials += 1
             
-            if total_trials >= trials_to_compute:
-                break
-        
-        # Aggregate with existing trials
-        n_train = len(pool_idx)
-        n_test = len(test_idx)
+            # Get fold sizes from last split (for reporting n_train, n_test)
+            # If we ran trials, pool_idx and test_idx are defined
+            n_train = len(pool_idx)
+            n_test = len(test_idx)
+        else:
+            # No new trials computed - use a single split to get n_train/n_test for reporting
+            skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=random_state)
+            pool_idx, test_idx = next(iter(skf.split(X1, y_bins)))
+            n_train = len(pool_idx)
+            n_test = len(test_idx)
         
         # Combine existing trials with new trials for statistics calculation
         # Use only the MINIMUM number of existing trials to ensure arrays match
@@ -645,6 +659,11 @@ def subsampled_repeated_kfold_comparison(
         
         all_model1_trials = existing_m1_trials + new_m1_trials
         all_model2_trials = existing_m2_trials + new_m2_trials
+        
+        # Check if we have any trials to compare
+        if len(all_model1_trials) == 0 or len(all_model2_trials) == 0:
+            print(f"  WARNING: No trials available for comparison at sample_size={sample_size}")
+            continue
         
         # Extract metrics from all trials: (fold_idx, repeat, ktau, mse)
         all_model1_ktau = [t[2] for t in all_model1_trials]  # index 2 is ktau
@@ -766,6 +785,65 @@ def subsampled_repeated_kfold_comparison(
             print(f"  ✗ NOT SIGNIFICANT (p≥0.05): Cannot conclude which is better")
         
         print(f"{'='*70}")
+        
+        # Save results incrementally after each sample size completes
+        # Save even if no new trials were computed (for statistical comparison)
+        if per_embedding_output_dir and comparison_output_path:
+            print(f"\nSaving results for sample_size={sample_size}...")
+            
+            # Create mini result DataFrame for just this sample size
+            sample_result_df = pd.DataFrame([results[-1]])  # Last entry is current sample_size
+            
+            # Add metadata to match run_comparison format
+            sample_result_df['comparison_type'] = comparison_label if comparison_label else 'comparison'
+            sample_result_df['embedding1'] = model1_name.replace('_corpus1', '')
+            sample_result_df['embedding2'] = model2_name.replace('_corpus2', '')
+            sample_result_df['corpus1'] = corpus1_name if corpus1_name else 'corpus'
+            sample_result_df['corpus2'] = corpus2_name if corpus2_name else 'corpus'
+            
+            # Extract trials for this sample size from trial_data_dict (only NEW trials)
+            sample_trials_dict = {}
+            if trial_data_dict and trials_to_compute > 0:
+                # Only save Type 1 if we have NEW trials
+                if model1_name in trial_data_dict and sample_size in trial_data_dict[model1_name]:
+                    sample_trials_dict[model1_name] = {sample_size: trial_data_dict[model1_name][sample_size]}
+                if model2_name in trial_data_dict and sample_size in trial_data_dict[model2_name]:
+                    sample_trials_dict[model2_name] = {sample_size: trial_data_dict[model2_name][sample_size]}
+            
+            # Always save Type 2 comparison results (even if no new trials)
+            # Type 2 is the statistical comparison which we always want to save
+            if sample_trials_dict:
+                # We have new trials - save both Type 1 and Type 2
+                per_embedding_dict, comparison_df = split_results_for_saving(sample_result_df, sample_trials_dict)
+                
+                # Save Type 1: Per-embedding results (only if new trials)
+                for embedding_name, emb_df in per_embedding_dict.items():
+                    if len(emb_df) > 0:
+                        # Determine corpus name
+                        if embedding_name == model1_name:
+                            corpus_name_to_use = corpus1_name if corpus1_name else 'corpus'
+                        else:
+                            corpus_name_to_use = corpus2_name if corpus2_name else 'corpus'
+                        
+                        save_per_embedding_results(emb_df, per_embedding_output_dir, 
+                                                  embedding_name, corpus_name_to_use)
+                        print(f"  Saved Type 1 CSV for {embedding_name}")
+                
+                # Save Type 2: Comparison results
+                save_comparison_results(comparison_df, comparison_output_path)
+                print(f"  Saved Type 2 CSV for comparison")
+            else:
+                # No new trials, but still save Type 2 comparison results
+                # Create a dummy trials dict for split_results_for_saving
+                dummy_trials_dict = {
+                    model1_name: {sample_size: []},
+                    model2_name: {sample_size: []}
+                }
+                _, comparison_df = split_results_for_saving(sample_result_df, dummy_trials_dict)
+                
+                # Save Type 2 only
+                save_comparison_results(comparison_df, comparison_output_path)
+                print(f"  Saved Type 2 CSV for comparison (no new Type 1 trials)")
     
     return pd.DataFrame(results)
 
@@ -802,7 +880,9 @@ def run_comparison(
     use_single_target_embedding1=False,
     use_single_target_embedding2=False,
     head_type_embedding1='mlp',
-    head_type_embedding2='mlp'
+    head_type_embedding2='mlp',
+    combine_embeddings1=None,
+    combine_embeddings2=None
 ):
     """
     Compare two embeddings (same corpus or cross-corpus).
@@ -814,9 +894,9 @@ def run_comparison(
       4. Compute aggregated statistics and save to Type 2 CSV
     
     Args:
-        embedding1_name: Name of first embedding
+        embedding1_name: Name of first embedding (or base name if combine_embeddings1 is provided)
         corpus1_name: Name identifier for corpus 1 (used in filenames)
-        embedding2_name: Name of second embedding
+        embedding2_name: Name of second embedding (or base name if combine_embeddings2 is provided)
         corpus2_name: Name identifier for corpus 2 (used in filenames)
         corpus_path1: Path to corpus for embedding1 (and embedding2 if corpus_path2=None)
         corpus_path2: Path to corpus for embedding2 (if None, use corpus_path1 for both)
@@ -845,6 +925,9 @@ def run_comparison(
         use_single_target_embedding2: If True, train embedding2 model only on valid accuracy
         head_type_embedding1: Type of head for embedding1 ('mlp', 'xgboost', or 'perceiver')
         head_type_embedding2: Type of head for embedding2 ('mlp', 'xgboost', or 'perceiver')
+        combine_embeddings1: If provided, list of embedding column names to concatenate for embedding1
+                            (e.g., ['yi_coder_1_5_pytorch_code_embedding', 'modernbert_large_pytorch_code_embedding'])
+        combine_embeddings2: If provided, list of embedding column names to concatenate for embedding2
     
     Returns:
         DataFrame with comparison results
@@ -867,15 +950,52 @@ def run_comparison(
         df = pd.read_pickle(corpus_path1)
         print(f"  Loaded {len(df)} architectures")
         
-        # Verify both embeddings exist
-        if embedding1_name not in df.columns:
-            raise ValueError(f"Embedding '{embedding1_name}' not found in corpus")
-        if embedding2_name not in df.columns:
-            raise ValueError(f"Embedding '{embedding2_name}' not found in corpus")
+        # Handle embedding concatenation for embedding1
+        if combine_embeddings1 and len(combine_embeddings1) > 0:
+            # Concatenate multiple embeddings
+            print(f"\nCombining embeddings for embedding1: {combine_embeddings1}")
+            embedding1_arrays = []
+            for emb_name in combine_embeddings1:
+                if emb_name not in df.columns:
+                    raise ValueError(f"Embedding '{emb_name}' not found in corpus")
+                embedding1_arrays.append(np.array(df[emb_name].tolist()).astype(np.float32))
+            
+            # Concatenate along feature dimension
+            X1 = np.concatenate(embedding1_arrays, axis=-1)
+            
+            # Create combined name
+            combined_name1 = '+'.join([e.replace('_embedding', '') for e in combine_embeddings1]) + '_combined'
+            embedding1_name = combined_name1
+            print(f"  Combined shape: {X1.shape} (concatenated {len(combine_embeddings1)} embeddings)")
+        else:
+            # Single embedding
+            if embedding1_name not in df.columns:
+                raise ValueError(f"Embedding '{embedding1_name}' not found in corpus")
+            X1 = np.array(df[embedding1_name].tolist()).astype(np.float32)
         
-        # Extract embeddings
-        X1 = np.array(df[embedding1_name].tolist()).astype(np.float32)
-        X2 = np.array(df[embedding2_name].tolist()).astype(np.float32)
+        # Handle embedding concatenation for embedding2
+        if combine_embeddings2 and len(combine_embeddings2) > 0:
+            # Concatenate multiple embeddings
+            print(f"\nCombining embeddings for embedding2: {combine_embeddings2}")
+            embedding2_arrays = []
+            for emb_name in combine_embeddings2:
+                if emb_name not in df.columns:
+                    raise ValueError(f"Embedding '{emb_name}' not found in corpus")
+                embedding2_arrays.append(np.array(df[emb_name].tolist()).astype(np.float32))
+            
+            # Concatenate along feature dimension
+            X2 = np.concatenate(embedding2_arrays, axis=-1)
+            
+            # Create combined name
+            combined_name2 = '+'.join([e.replace('_embedding', '') for e in combine_embeddings2]) + '_combined'
+            embedding2_name = combined_name2
+            print(f"  Combined shape: {X2.shape} (concatenated {len(combine_embeddings2)} embeddings)")
+        else:
+            # Single embedding
+            if embedding2_name not in df.columns:
+                raise ValueError(f"Embedding '{embedding2_name}' not found in corpus")
+            X2 = np.array(df[embedding2_name].tolist()).astype(np.float32)
+
         
         # Create unique model names with configuration suffixes
         # This ensures different training configurations are distinguished even for same embedding
@@ -929,15 +1049,51 @@ def run_comparison(
         if len(df1) != len(df2):
             raise ValueError(f"Corpus sizes don't match: {len(df1)} vs {len(df2)}")
         
-        # Verify embeddings exist
-        if embedding1_name not in df1.columns:
-            raise ValueError(f"Embedding '{embedding1_name}' not found in corpus 1")
-        if embedding2_name not in df2.columns:
-            raise ValueError(f"Embedding '{embedding2_name}' not found in corpus 2")
+        # Handle embedding concatenation for embedding1
+        if combine_embeddings1 and len(combine_embeddings1) > 0:
+            # Concatenate multiple embeddings
+            print(f"\nCombining embeddings for embedding1: {combine_embeddings1}")
+            embedding1_arrays = []
+            for emb_name in combine_embeddings1:
+                if emb_name not in df1.columns:
+                    raise ValueError(f"Embedding '{emb_name}' not found in corpus 1")
+                embedding1_arrays.append(np.array(df1[emb_name].tolist()).astype(np.float32))
+            
+            # Concatenate along feature dimension
+            X1 = np.concatenate(embedding1_arrays, axis=-1)
+            
+            # Create combined name
+            combined_name1 = '+'.join([e.replace('_embedding', '') for e in combine_embeddings1]) + '_combined'
+            embedding1_name = combined_name1
+            print(f"  Combined shape: {X1.shape} (concatenated {len(combine_embeddings1)} embeddings)")
+        else:
+            # Single embedding
+            if embedding1_name not in df1.columns:
+                raise ValueError(f"Embedding '{embedding1_name}' not found in corpus 1")
+            X1 = np.array(df1[embedding1_name].tolist()).astype(np.float32)
         
-        # Extract embeddings
-        X1 = np.array(df1[embedding1_name].tolist()).astype(np.float32)
-        X2 = np.array(df2[embedding2_name].tolist()).astype(np.float32)
+        # Handle embedding concatenation for embedding2
+        if combine_embeddings2 and len(combine_embeddings2) > 0:
+            # Concatenate multiple embeddings
+            print(f"\nCombining embeddings for embedding2: {combine_embeddings2}")
+            embedding2_arrays = []
+            for emb_name in combine_embeddings2:
+                if emb_name not in df2.columns:
+                    raise ValueError(f"Embedding '{emb_name}' not found in corpus 2")
+                embedding2_arrays.append(np.array(df2[emb_name].tolist()).astype(np.float32))
+            
+            # Concatenate along feature dimension
+            X2 = np.concatenate(embedding2_arrays, axis=-1)
+            
+            # Create combined name
+            combined_name2 = '+'.join([e.replace('_embedding', '') for e in combine_embeddings2]) + '_combined'
+            embedding2_name = combined_name2
+            print(f"  Combined shape: {X2.shape} (concatenated {len(combine_embeddings2)} embeddings)")
+        else:
+            # Single embedding
+            if embedding2_name not in df2.columns:
+                raise ValueError(f"Embedding '{embedding2_name}' not found in corpus 2")
+            X2 = np.array(df2[embedding2_name].tolist()).astype(np.float32)
         
         # Create unique model names with corpus and configuration suffixes
         model1_name = f"{embedding1_name}_corpus1"
@@ -985,6 +1141,8 @@ def run_comparison(
         y = df[['test_acc', 'valid_acc']].values.astype(np.float32)
     elif benchmark_type == 'einspace':
         y = df[['accuracy', 'accuracy']].values.astype(np.float32)
+    elif benchmark_type == 'nasbench101':
+        y = df[['cifar10_test_accuracy', 'cifar10_valid_accuracy']].values.astype(np.float32)
     else:
         raise ValueError(f"Unknown benchmark_type: {benchmark_type}")
     
@@ -1050,6 +1208,7 @@ def run_comparison(
         print()
     
     # Run comparison (new_trials_dict will be populated with NEW trials only)
+    # Results will be saved incrementally after each sample size
     result_df = subsampled_repeated_kfold_comparison(
         X, y, embedding_types,
         sample_sizes=sample_sizes,
@@ -1076,10 +1235,15 @@ def run_comparison(
         use_single_target_model1=use_single_target_embedding1,
         use_single_target_model2=use_single_target_embedding2,
         head_type_model1=head_type_embedding1,
-        head_type_model2=head_type_embedding2
+        head_type_model2=head_type_embedding2,
+        per_embedding_output_dir=per_embedding_output_dir,
+        comparison_output_path=comparison_output_path,
+        corpus1_name=corpus1_name,
+        corpus2_name=corpus2_name,
+        comparison_label=comparison_label
     )
     
-    # Add metadata
+    # Add metadata (for consistency, even though saving happened incrementally)
     result_df['comparison_type'] = comparison_label
     
     # Use model names for display (already have config suffixes: _pca64, _pairwise, etc.)
@@ -1092,29 +1256,8 @@ def run_comparison(
     result_df['corpus1'] = corpus1_name
     result_df['corpus2'] = corpus2_name
 
-    
-    # Split and save results - use new_trials_dict which contains ONLY new trials
-    per_embedding_dict, comparison_df = split_results_for_saving(result_df, new_trials_dict)
-    
-    # Save Type 1: Per-embedding results (ALWAYS save using full model name)
-    if per_embedding_output_dir:
-        print(f"\nSaving per-embedding results (Type 1)...")
-        for embedding_name, emb_df in per_embedding_dict.items():
-            if len(emb_df) > 0:  # Only save if there are new trials
-                # Determine which corpus this embedding belongs to
-                if embedding_name == model1_name:
-                    corpus_name = corpus1_name
-                else:
-                    corpus_name = corpus2_name
-                
-                # Always save using full model name (includes all config suffixes)
-                save_per_embedding_results(emb_df, per_embedding_output_dir, 
-                                          embedding_name, corpus_name)
-    
-    # Save Type 2: Comparison results (always save)
-    if comparison_output_path:
-        print(f"\nSaving comparison results (Type 2)...")
-        save_comparison_results(comparison_df, comparison_output_path)
+    # Note: Results have already been saved incrementally after each sample size
+    print(f"\nAll results saved incrementally during computation.")
     
     return result_df
 
@@ -1136,6 +1279,27 @@ if __name__ == '__main__':
         per_embedding_output_dir='/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/per_embedding_results/',
         device='cuda'
     )
+    
+    # Example usage with embedding concatenation
+    # To concatenate multiple embeddings (e.g., yi_coder_1_5 + modernbert_large):
+    # results = run_comparison(
+    #     embedding1_name='combined',  # This will be overridden by combine_embeddings1
+    #     corpus1_name='nasbench201',
+    #     embedding2_name='baseline_embedding',
+    #     corpus2_name='nasbench201',
+    #     corpus_path1='/path/to/corpus.pkl',
+    #     corpus_path2=None,
+    #     comparison_label='combined_vs_baseline',
+    #     sample_sizes=[15, 50, 150, 500, 1500],
+    #     n_folds=5,
+    #     n_repeats=5,
+    #     benchmark_type='nasbench',
+    #     comparison_output_path='/path/to/comparisons_global.csv',
+    #     per_embedding_output_dir='/path/to/per_embedding_results/',
+    #     device='cuda',
+    #     combine_embeddings1=['yi_coder_1_5_pytorch_code_embedding', 'modernbert_large_pytorch_code_embedding'],
+    #     # combine_embeddings2=['another_embedding1', 'another_embedding2']  # Optional for embedding2
+    # )
     
     print("\n" + "="*80)
     print("Final Results Summary")

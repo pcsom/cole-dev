@@ -107,12 +107,12 @@ MODEL_CONFIGS = [
         'sentence_transformer': False
     },
     {
-        'name': 'mistralai/Yi-Coder-9B',
+        'name': '01-ai/Yi-Coder-9B',
         'display_name': 'yi_coder_9b',
         'sentence_transformer': False
     },
     {
-        'name': 'mistralai/Yi-Coder-1.5B',
+        'name': '01-ai/Yi-Coder-1.5B',
         'display_name': 'yi_coder_1_5b',
         'sentence_transformer': False
     },

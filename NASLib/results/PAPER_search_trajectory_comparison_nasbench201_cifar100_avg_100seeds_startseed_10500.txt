@@ -1,0 +1,45 @@
+=== Optimal Architecture Performance ===
+Optimal: 73.49%
+
+=== Method Statistics - Best Individual (% Validation Accuracy) ===
+BANANAS (Path Encoding): Mean = 73.177%, Std = 0.174%
+BANANAS (COLE): Mean = 73.236%, Std = 0.035%
+
+=== Method Statistics - Cumulative (% Validation Accuracy) ===
+BANANAS (Path Encoding): Mean = 72.563%
+BANANAS (COLE): Mean = 72.741%
+
+=== Method Statistics - AUC (Area Under Curve) ===
+BANANAS (Path Encoding): AUC = 36213.31
+BANANAS (COLE): AUC = 36302.72
+
+=== Convergence Speed (Iterations to reach thresholds) ===
+
+Threshold: 72.02% (98.0% of optimal)
+  BANANAS (Path Encoding): 80 iterations
+  BANANAS (COLE): 61 iterations
+
+Threshold: 72.39% (98.5% of optimal)
+  BANANAS (Path Encoding): 112 iterations
+  BANANAS (COLE): 90 iterations
+
+Threshold: 72.57% (98.8% of optimal)
+  BANANAS (Path Encoding): 150 iterations
+  BANANAS (COLE): 109 iterations
+
+Threshold: 72.76% (99.0% of optimal)
+  BANANAS (Path Encoding): 200 iterations
+  BANANAS (COLE): 132 iterations
+
+Threshold: 72.94% (99.2% of optimal)
+  BANANAS (Path Encoding): 261 iterations
+  BANANAS (COLE): 169 iterations
+
+Threshold: 73.12% (99.5% of optimal)
+  BANANAS (Path Encoding): 390 iterations
+  BANANAS (COLE): 234 iterations
+
+=== Average Pairwise Differences (% Validation Accuracy) ===
+Cumulative: BANANAS (COLE) - BANANAS (Path Encoding): +0.179%
+Best individual: BANANAS (COLE) - BANANAS (Path Encoding): +0.059%
+AUC: BANANAS (COLE) - BANANAS (Path Encoding): +89.41

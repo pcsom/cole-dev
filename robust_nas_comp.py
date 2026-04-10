@@ -9,27 +9,27 @@ from embed_corpus import add_embeddings_to_corpus
 # Paths
 NASBENCH_CORPUS_PATH = '/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus_embedded.pkl'
 NASBENCH_CORPUS_OUTPUT_PATH = '/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/nasbench201_corpus_embedded_pytorch.pkl'
-OUTPUT_PATH = '/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/refactor/nasbench_context_comparison.csv'
-OUTPUT_PATH_CSV = '/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/refactor'
+OUTPUT_PATH = '/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/zca/nasbench_zca_comparison.csv'
+OUTPUT_PATH_CSV = '/storage/ice-shared/vip-vvk/data/AOT/psomu3/codenas/zca'
 COMPARISON_LABEL = 'nasbench201'
 
 # Configuration
 # SAMPLE_SIZES = [15, 50, 150, 500, 1500, 5000]  # Training set sizes to test
-# SAMPLE_SIZES = [14, 56, 224, 896, 3584, 14062]  # Training set sizes to test
-SAMPLE_SIZES = [8, 39, 78, 224, 896, 3584, 14062]  # Training set sizes to test
+SAMPLE_SIZES = [14, 55, 220, 879, 3516, 14062]  # Training set sizes to test
+# SAMPLE_SIZES = [8, 39, 78, 224, 896, 3584, 14062]  # Training set sizes to test
 N_FOLDS = 10       # 10-fold cross-validation
-N_REPEATS = 10    # If Repeat CV 50 times, then 500 total trials per sample size
+N_REPEATS = 20    # If Repeat CV 50 times, then 500 total trials per sample size
 FORCE = False     # If True, recompute everything; if False, only add missing data
 
-df = add_embeddings_to_corpus(
-    corpus_path=NASBENCH_CORPUS_PATH,
-    model_name='modernbert_large',
-    output_path=NASBENCH_CORPUS_PATH,
-    pytorch_only=True,
-    use_echo_embeddings=False,
-    device='cuda',
-    max_length=512
-)
+# df = add_embeddings_to_corpus(
+#     corpus_path=NASBENCH_CORPUS_PATH,
+#     model_name='codellama_python_7b',
+#     output_path=NASBENCH_CORPUS_PATH,
+#     pytorch_only=True,
+#     use_echo_embeddings=False,
+#     device='cuda',
+#     max_length=512
+# )
 # df = add_embeddings_to_corpus(
 #     corpus_path=NASBENCH_CORPUS_PATH,
 #     model_name='codellama_instruct_7b',
@@ -66,20 +66,22 @@ df = add_embeddings_to_corpus(
 #     force=FORCE
 # )
 
+# print("XGB config: previously lr 0.05, n_estimators=500. now lr 0.01, n_estimators 2000")
+# print("XGB config: prev did not define min_child_weight or gamma. now min_child_weight=5, gamma=0.1")
 
 
 # Run robust comparison (only computes missing trials)
 print("\n" + "=" * 80)
-print("NASBench-201 Robust Comparison: modernbert_large_pytorch_code_embedding with pairwise loss and pca vs modernbert_large_pytorch_code_embedding with pairwise loss")
+print("NASBench-201 Robust Comparison: codellama_python_7b_pytorch_code_embedding with pairwise loss, single target, zca 0.8, pca 128 vs codellama_python_7b_pytorch_code_embedding with pairwise loss, single target, zca 0.8, pca 256")
 print(f"  Sample sizes: {SAMPLE_SIZES}")
 print(f"  CV setup: {N_FOLDS}-fold × {N_REPEATS} repeats = {N_FOLDS * N_REPEATS} trials per size")
 print("  (Will only compute missing trials, preserves existing results)")
 print("=" * 80)
 
 results_df = run_comparison(
-    embedding1_name='modernbert_large_pytorch_code_embedding',
+    embedding1_name='codellama_python_7b_pytorch_code_embedding',
     corpus1_name='nasbench201',
-    embedding2_name='modernbert_large_pytorch_code_embedding',
+    embedding2_name='codellama_python_7b_pytorch_code_embedding',
     corpus2_name='nasbench201',
     corpus_path1=NASBENCH_CORPUS_PATH,
     corpus_path2=NASBENCH_CORPUS_PATH,
@@ -92,12 +94,20 @@ results_df = run_comparison(
     per_embedding_output_dir=OUTPUT_PATH_CSV,
     device='cuda',
     force=FORCE,
-    apply_pca_to_embedding1=True,
-    pca_n_components_embedding1=128,
-    apply_pca_to_embedding2=False,
-    pca_n_components_embedding2=128,
+    dim_reduction_method_embedding1='pca',
+    dim_reduction_components_embedding1=128,
+    dim_reduction_method_embedding2='pca',
+    dim_reduction_components_embedding2=256,
+    apply_zca_to_embedding1=True,
+    zca_epsilon_embedding1=0.8,
+    apply_zca_to_embedding2=True,
+    zca_epsilon_embedding2=0.8,
     use_pairwise_loss_embedding1=True,
-    use_pairwise_loss_embedding2=True
+    use_pairwise_loss_embedding2=True,
+    use_single_target_embedding1=True,
+    use_single_target_embedding2=True,
+    head_type_embedding1='mlp',
+    head_type_embedding2='mlp'
 )
 
 

@@ -69,9 +69,9 @@ print("  (Will only compute missing trials, preserves existing results)")
 print("=" * 80)
 
 results_df = run_comparison(
-    embedding1_name=f'{model1}_pytorch_code_exclude_helper_embedding',
+    embedding1_name=f'{model1}_pytorch_code_exclude_helper_avg_avg_embedding',
     corpus1_name='core',
-    embedding2_name=f'{model2}_pytorch_code_exclude_helper_embedding',
+    embedding2_name=f'{model2}_pytorch_code_exclude_helper_avg_avg_embedding',
     corpus2_name='core',
     corpus_path1=NASBENCH_CORPUS_OUTPUT_PATH,
     corpus_path2=NASBENCH_CORPUS_OUTPUT_PATH,
