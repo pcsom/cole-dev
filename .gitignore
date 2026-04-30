@@ -3,3 +3,6 @@ jahs_bench_data
 *.out
 logs
 old_logs
+clusters/
+cluster_comparison.md
+test_reverse_mapping.txt
